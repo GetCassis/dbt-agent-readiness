@@ -1,0 +1,81 @@
+version: 2
+
+sources:
+  - name: jaffle_shop
+    schema: raw
+    description: "Raw data from the Jaffle Shop application database"
+    tables:
+      - name: raw_customers
+        description: "Raw customer records"
+        columns:
+          - name: id
+            description: "Primary key"
+          - name: first_name
+          - name: last_name
+          - name: created_at
+      - name: raw_orders
+        description: "Raw order records"
+        columns:
+          - name: id
+          - name: user_id
+          - name: order_date
+          - name: status
+      - name: raw_payments
+        description: "Raw payment records"
+        columns:
+          - name: id
+          - name: order_id
+          - name: payment_method
+          - name: amount
+            description: "Amount in cents"
+      - name: raw_customer_events
+      - name: raw_refunds
+
+models:
+  - name: stg_customers
+    description: "Staged customer records with renamed columns"
+    columns:
+      - name: customer_id
+        description: "Primary key"
+        tests:
+          - unique
+          - not_null
+      - name: first_name
+        description: "Customer first name"
+      - name: last_name
+        description: "Customer last name"
+      - name: signup_date
+        description: "Date the customer signed up"
+
+  - name: stg_orders
+    description: "Staged orders"
+    columns:
+      - name: order_id
+        description: "The ID"
+        tests:
+          - unique
+          - not_null
+      - name: cust_id
+        description: "Customer identifier"
+      - name: order_date
+      - name: status
+      - name: is_completed
+
+  - name: stg_payments
+    description: "Staged payment records with amount converted from cents to dollars"
+    columns:
+      - name: payment_id
+        description: "Payment ID"
+        tests:
+          - unique
+          - not_null
+      - name: order_id
+        tests:
+          - not_null
+      - name: payment_method
+        description: "Method used for this payment"
+        tests:
+          - accepted_values:
+              values: ['credit_card', 'coupon', 'bank_transfer', 'gift_card']
+      - name: amount
+        description: "The amount"

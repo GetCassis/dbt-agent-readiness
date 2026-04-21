@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: customers
+    description: "One record per customer with lifetime metrics"
+    columns:
+      - name: customer_id
+        description: "Primary key"
+        tests:
+          - unique
+          - not_null
+      - name: first_name
+      - name: last_name
+      - name: signup_date
+      - name: first_order_date
+        description: "Date of the customer's first order"
+      - name: most_recent_order
+      - name: number_of_orders
+        description: "Total count of orders"
+      - name: customer_lifetime_value
+        description: "Total payment amount across all orders (USD)"
+      - name: loyalty_tier
+        description: "Customer loyalty classification based on LTV"
+
+  - name: orders
+    description: "One record per order with payment totals"
+    columns:
+      - name: order_id
+        description: "Order ID"
+      - name: customer_id
+        description: "Customer identifier"
+      - name: order_date
+      - name: status
+      - name: amount
+        description: "The amount"
+      - name: payment_count
+      - name: payment_method_count
+
+  - name: fct_revenue
+    columns:
+      - name: revenue_date
+      - name: cust_id
+      - name: total_revenue
+      - name: transaction_count
+      - name: order_count
+      - name: cc_revenue
+      - name: gift_card_revenue
+      - name: coupon_amount
+      - name: has_refund

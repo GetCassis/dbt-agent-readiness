@@ -1,0 +1,14 @@
+version: 2
+
+models:
+  - name: int_customer_orders
+    description: "Aggregated order metrics per customer"
+    columns:
+      - name: customer_id
+        description: "Customer ID"
+      - name: first_order_date
+        description: "Date of first order"
+      - name: last_order_at
+        description: "Timestamp of most recent order"
+      - name: order_count
+      - name: completed_order_count
