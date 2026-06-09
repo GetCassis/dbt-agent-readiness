@@ -771,7 +771,7 @@ def extract_columns_from_block(sql_block):
     return (names, len(names)) if names else ([], -1)
 
 
-def _resolve_cte_columns(tree, max_depth=10):
+def _resolve_cte_columns(tree, max_depth=10, known=None):
     """Resolve output columns for every CTE in `tree` via multi-hop trace.
 
     Returns {cte_name_lower: [col_lower, ...]}. A CTE whose select list is
@@ -780,6 +780,10 @@ def _resolve_cte_columns(tree, max_depth=10):
     computed expressions without aliases are omitted (callers treat their
     absence as "unknown shape"). Recursion is bounded by `max_depth` to
     guard against pathological or self-referential chains.
+
+    `known` optionally seeds the resolution map with externally known
+    relation shapes ({name_lower: [col_lower, ...]}), e.g. other models'
+    extracted columns, so `SELECT * FROM <ref'd model>` resolves too.
     """
     from sqlglot import exp
 
@@ -790,6 +794,10 @@ def _resolve_cte_columns(tree, max_depth=10):
         if nm and isinstance(inner, exp.Select):
             ctes_by_name[nm] = inner
 
+    # External shapes are consulted only when a name is NOT a local CTE —
+    # a CTE named like a model must shadow the model (SQL scoping rules).
+    external = {k.lower(): [c.lower() for c in v]
+                for k, v in (known or {}).items()}
     resolved = {}
     resolving = set()
 
@@ -800,11 +808,10 @@ def _resolve_cte_columns(tree, max_depth=10):
             return resolved[name]
         if name in resolving:
             return None
-        resolving.add(name)
         sel = ctes_by_name.get(name)
         if sel is None:
-            resolving.discard(name)
-            return None
+            return external.get(name)
+        resolving.add(name)
         out = _resolve_select_columns(sel, resolved, _resolve, depth + 1)
         resolving.discard(name)
         if out is not None:
@@ -813,7 +820,8 @@ def _resolve_cte_columns(tree, max_depth=10):
 
     for nm in ctes_by_name:
         _resolve(nm, 0)
-    return resolved
+    # Merged view for relation lookups: local CTEs win over externals.
+    return {**external, **resolved}
 
 
 def _resolve_select_columns(sel, resolved, recurse, depth):
@@ -1510,10 +1518,12 @@ def build_relationships(columns, models, semantic_models):
     return {'declared': declared, 'implicit': implicit}
 
 
-def build_test_summary(columns):
+def build_test_summary(columns, models_dict=None):
     counts = defaultdict(int)
     models_with_tests = set()
-    all_models = set()
+    # Models with no YAML entry at all also have zero tests — enumerate
+    # from the full model set, not just YAML-documented columns.
+    all_models = set(models_dict or {})
     cat_without_av = []
 
     for c in columns:
@@ -1545,6 +1555,7 @@ def build_test_summary(columns):
         'accepted_values_tests': counts['accepted_values'],
         'other_tests': counts['other'],
         'models_with_zero_tests': len(all_models - models_with_tests),
+        'models_with_zero_tests_list': sorted(all_models - models_with_tests),
         'categorical_columns_without_accepted_values': cat_without_av,
     }
 
@@ -2696,6 +2707,360 @@ def _detect_macro_column_generation(sql, columns_resolved=False):
     return (bool(signals), signals)
 
 
+# ── Undefined column references & fan-out joins ─────────────────────────────
+
+def _strip_jinja_resolving_refs(sql):
+    """Like strip_jinja_comments, but keeps relation identity.
+
+    `{{ ref('x') }}` becomes the bare identifier `x` and
+    `{{ source('a', 'b') }}` becomes `__source__a__b`, so the parsed tree
+    still knows which relation each FROM/JOIN points at. All other Jinja
+    expressions are replaced with `__JINJA__` as before.
+    """
+    s = JINJA_COMMENT_RE.sub('', sql)
+
+    def _expr_sub(m):
+        text = m.group(0)
+        rm = REF_RE.search(text)
+        if rm:
+            return (rm.group(2) or rm.group(1)).lower()
+        sm = SOURCE_RE.search(text)
+        if sm:
+            return f'__source__{sm.group(1)}__{sm.group(2)}'.lower()
+        return '__JINJA__'
+
+    s = JINJA_EXPR_RE.sub(_expr_sub, s)
+    s = JINJA_BLOCK_RE.sub('', s)
+    s = SQL_BLOCK_COMMENT_RE.sub('', s)
+    s = SQL_LINE_COMMENT_RE.sub('', s)
+    return s
+
+
+def _known_model_shapes(sql_data, manifest_used=False):
+    """{model_name_lower: [col_lower, ...]} for models whose column list can
+    be TRUSTED as complete, not merely non-empty.
+
+    Excluded (their shape would make downstream undefined-column checks
+    fire on real columns):
+    - models whose extraction fell back to the regex path (e.g. incremental
+      models where the `is_incremental()` tail subquery becomes the "last
+      SELECT");
+    - models with macro-generated columns (dbt_utils.star, Jinja for-loops)
+      when no compiled manifest exists — the static list misses the
+      injected columns.
+    """
+    shapes = {}
+    for name, sd in (sql_data or {}).items():
+        if sd.get('parse_fallback'):
+            continue
+        if sd.get('column_count', -1) <= 0:
+            continue
+        if not manifest_used:
+            sql_text = _read_model_sql(sd)
+            if sql_text is None:
+                continue
+            uses_macros, _signals = _detect_macro_column_generation(
+                sql_text, columns_resolved=True)
+            if uses_macros:
+                continue
+        cols = [c.lower() for c in (sd.get('columns') or [])
+                if c and c not in ('__jinja_generated__', '__unknown__',
+                                   '*')]
+        if cols:
+            shapes[name.lower()] = cols
+    return shapes
+
+
+def _scope_relations(sel, resolved):
+    """Resolve every FROM/JOIN relation of one Select scope.
+
+    Returns {alias_lower: set(columns)} when EVERY relation resolves to a
+    known column set (CTE or external model shape), else None. Subqueries,
+    sources, and unresolved relations make the whole scope unresolvable —
+    the undefined-column check then skips it rather than guessing.
+    """
+    from sqlglot import exp
+
+    tables = []
+    from_clause = sel.args.get('from_') or sel.args.get('from')
+    if from_clause is not None:
+        tables.append(from_clause.this)
+    for j in (sel.args.get('joins') or []):
+        tables.append(j.this)
+    if not tables:
+        return None
+
+    rels = {}
+    for t in tables:
+        if not isinstance(t, exp.Table):
+            return None
+        name = t.name.lower()
+        cols = resolved.get(name)
+        if cols is None:
+            return None
+        alias = (t.alias or t.name).lower()
+        rels[alias] = set(cols)
+    return rels
+
+
+def _build_undefined_column_refs(sql_data, manifest_used=False, dialect=None):
+    """Flag columns referenced in a SELECT list or GROUP BY that no input
+    relation of that scope produces.
+
+    For each model, every Select scope (the outer query and each CTE) is
+    checked independently. A scope is only checked when ALL of its
+    FROM/JOIN relations resolve to a known column set — CTEs resolved
+    recursively (depth 10), ref'd models resolved through their own
+    extracted columns. A column reference is undefined when:
+    - qualified (`t.col`): `col` is not in relation `t`'s column set;
+    - unqualified: `col` is in no relation's set AND is not an explicit
+      `AS` alias of another select item in the same scope (so
+      self-referencing-alias bugs are not double-reported here).
+
+    A bare select item like `has_refund` does NOT count as its own alias —
+    it provides no evidence the column exists anywhere.
+
+    Macro-suppression mirrors phantom_columns_by_model: when the model uses
+    dbt_utils.star / unresolvable SELECT * / Jinja loops and no compiled
+    manifest exists, the model is skipped entirely rather than emitting
+    noise. All emitted rows carry confidence 'high'.
+    """
+    from sqlglot import exp
+
+    shapes = _known_model_shapes(sql_data, manifest_used=manifest_used)
+    rows = []
+
+    for name, sd in sorted((sql_data or {}).items()):
+        if sd.get('parse_fallback'):
+            continue
+        sql_text = _read_model_sql(sd)
+        if not sql_text:
+            continue
+        if not manifest_used:
+            columns_resolved = (bool(sd.get('columns'))
+                                and sd.get('column_count', -1) > 0)
+            uses_macros, _signals = _detect_macro_column_generation(
+                sql_text, columns_resolved=columns_resolved)
+            if uses_macros:
+                continue
+
+        clean = _strip_jinja_resolving_refs(sql_text)
+        try:
+            tree = sqlglot.parse_one(clean, dialect=dialect)
+        except Exception:
+            continue
+        if not isinstance(tree, exp.Select):
+            continue
+
+        resolved = _resolve_cte_columns(tree, max_depth=10, known=shapes)
+
+        scopes = [('final_select', tree)]
+        for cte in tree.ctes:
+            nm = (cte.alias or '').lower()
+            if nm and isinstance(cte.this, exp.Select):
+                scopes.append((nm, cte.this))
+
+        found = {}  # column -> {clauses, scope, relations}
+        for scope_name, sel in scopes:
+            rels = _scope_relations(sel, resolved)
+            if rels is None:
+                continue
+            alias_set = {ex.alias.lower() for ex in sel.expressions
+                         if isinstance(ex, exp.Alias) and ex.alias}
+
+            def _check(col, clause):
+                if col.is_star:
+                    return
+                cname = col.name.lower()
+                if not cname or cname == '__jinja__':
+                    return
+                qual = (col.table or '').lower()
+                if qual:
+                    if qual not in rels:
+                        return  # unknown alias context — stay conservative
+                    defined = cname in rels[qual]
+                else:
+                    defined = (any(cname in s for s in rels.values())
+                               or cname in alias_set)
+                if not defined:
+                    entry = found.setdefault(cname, {
+                        'clauses': set(), 'scope': scope_name,
+                        'input_relations': sorted(rels.keys()),
+                    })
+                    entry['clauses'].add(clause)
+
+            for ex in sel.expressions:
+                for col in ex.find_all(exp.Column):
+                    _check(col, 'select')
+            group = sel.args.get('group')
+            if group is not None:
+                for col in group.find_all(exp.Column):
+                    _check(col, 'group_by')
+
+        for cname, info in sorted(found.items()):
+            rows.append({
+                'model': name,
+                'column': cname,
+                'clauses': sorted(info['clauses']),
+                'scope': info['scope'],
+                'input_relations': info['input_relations'],
+                'sql_path': sd.get('path'),
+                'confidence': 'high',
+                'why_agent_fails': (
+                    f'{name} references `{cname}` in '
+                    f'{" and ".join(sorted(info["clauses"]))} but no input '
+                    f'relation ({", ".join(info["input_relations"])}) '
+                    'produces it — the query fails at compile/run time.'),
+            })
+    return rows
+
+
+def _cte_passthrough_bases(tree, sql_data):
+    """Map CTE aliases to the model they are a grain-preserving view of.
+
+    A CTE maps to model M when its body selects FROM a single relation
+    (no joins, no GROUP BY, no DISTINCT) that is M itself or another CTE
+    that maps to M. Aggregating or joining CTEs map to nothing — joining
+    them is not a direct fan-out on M.
+    """
+    from sqlglot import exp
+
+    ctes_by_name = {}
+    for cte in tree.ctes:
+        nm = (cte.alias or '').lower()
+        if nm and isinstance(cte.this, exp.Select):
+            ctes_by_name[nm] = cte.this
+
+    bases = {}
+
+    def _base(nm, depth=0):
+        if depth > 10:
+            return None
+        if nm in bases:
+            return bases[nm]
+        sel = ctes_by_name.get(nm)
+        if sel is None:
+            return nm if nm in sql_data else None
+        if (sel.args.get('joins') or sel.args.get('group')
+                or sel.args.get('distinct')):
+            bases[nm] = None
+            return None
+        from_clause = sel.args.get('from_') or sel.args.get('from')
+        if (not isinstance(from_clause, exp.From)
+                or not isinstance(from_clause.this, exp.Table)):
+            bases[nm] = None
+            return None
+        bases[nm] = _base(from_clause.this.name.lower(), depth + 1)
+        return bases[nm]
+
+    for nm in ctes_by_name:
+        _base(nm)
+    return bases
+
+
+def _build_fan_out_joins(models_dict, sql_data, columns, dialect=None):
+    """Flag models joined by 2+ downstream models with no unique test on
+    the join key — the deterministic fan-out-risk catalog.
+
+    For each downstream model, every JOIN target is resolved to an
+    underlying model: directly (the relation IS a model after ref
+    substitution) or through a grain-preserving passthrough CTE
+    (`payments as (select * from <model>)`). The joined model's side of
+    each ON equality gives the join key. A (model, join_column) pair is
+    flagged when 2+ distinct downstream models join it and the column has
+    no `unique` test (and is not the model's tested PK).
+    """
+    from sqlglot import exp
+
+    # (model_lower, column_lower) pairs covered by a unique test
+    unique_cols = set()
+    for c in columns:
+        for t in (c.get('tests') or []):
+            if t.split(':')[0] == 'unique':
+                unique_cols.add((c['model'].lower(), c['column'].lower()))
+
+    joined_by = defaultdict(lambda: defaultdict(set))  # M -> col -> {downstream}
+    join_sql = {}  # (M, col) -> sample ON snippet
+
+    for dname, sd in sorted((sql_data or {}).items()):
+        sql_text = _read_model_sql(sd)
+        if not sql_text:
+            continue
+        clean = _strip_jinja_resolving_refs(sql_text)
+        try:
+            tree = sqlglot.parse_one(clean, dialect=dialect)
+        except Exception:
+            continue
+        if not isinstance(tree, exp.Select):
+            continue
+        cte_bases = _cte_passthrough_bases(tree, sql_data)
+
+        for node in tree.walk():
+            n = node[0] if isinstance(node, tuple) else node
+            if not isinstance(n, exp.Join):
+                continue
+            target = n.this
+            if not isinstance(target, exp.Table):
+                continue
+            tname = target.name.lower()
+            if tname in cte_bases:
+                model = cte_bases[tname]  # local CTE shadows any model name
+            else:
+                model = tname if tname in sql_data else None
+            if not model or model == dname:
+                continue
+            alias = (target.alias or target.name).lower()
+            on = n.args.get('on')
+            if on is None:
+                continue
+            for eq in on.find_all(exp.EQ):
+                le, ri = eq.left, eq.right
+                if not (isinstance(le, exp.Column)
+                        and isinstance(ri, exp.Column)):
+                    continue
+                key = None
+                if (le.table or '').lower() == alias:
+                    key = le.name.lower()
+                elif (ri.table or '').lower() == alias:
+                    key = ri.name.lower()
+                elif le.name.lower() == ri.name.lower():
+                    key = le.name.lower()
+                if key:
+                    joined_by[model][key].add(dname)
+                    join_sql.setdefault((model, key),
+                                        eq.sql(dialect=dialect)[:200])
+
+    rows = []
+    for model, by_col in sorted(joined_by.items()):
+        for col, downstreams in sorted(by_col.items()):
+            if len(downstreams) < 2:
+                continue
+            md = models_dict.get(model, {})
+            has_unique = ((model.lower(), col) in unique_cols
+                          or (md.get('has_pk_test')
+                              and (md.get('pk_column') or '').lower() == col))
+            if has_unique:
+                continue
+            rows.append({
+                'model': model,
+                'join_column': col,
+                'downstream_models': sorted(downstreams),
+                'inbound_join_count': len(downstreams),
+                'has_unique_test': False,
+                'sample_on_condition': join_sql.get((model, col)),
+                'confidence': 'high',
+                'verification_query': (
+                    f"select {col}, count(*) as n "
+                    f"from {{{{ ref('{model}') }}}} "
+                    f"group by {col} having count(*) > 1 limit 20"),
+                'why_agent_fails': (
+                    f'{len(downstreams)} downstream models join {model} on '
+                    f'`{col}` but nothing guarantees `{col}` is unique — '
+                    'duplicate keys silently multiply joined rows.'),
+            })
+    return rows
+
+
 # ── Description-contradicts-SQL catalog ──────────────────────────────────────
 
 _DESC_ALL_RE = re.compile(
@@ -2872,7 +3237,7 @@ def _build_description_contradicts_sql(models_dict, columns, sql_data, issues):
 
 def build_catalogs(models_dict, columns, concept_index, sql_data,
                    issues=None, seeds=None, project_root=None,
-                   manifest_used=False):
+                   manifest_used=False, dialect=None):
     """Build pre-computed catalogs that synthesis can emit directly as
     appendix sections. These complement the narrative root-issue framing with
     granular reference data: every missing description, every weak one, every
@@ -3110,6 +3475,11 @@ def build_catalogs(models_dict, columns, concept_index, sql_data,
 
     potential_unit_drift = _build_potential_unit_drift(sql_data)
 
+    undefined_column_refs = _build_undefined_column_refs(
+        sql_data, manifest_used=manifest_used, dialect=dialect)
+    fan_out_joins = _build_fan_out_joins(
+        models_dict, columns=columns, sql_data=sql_data, dialect=dialect)
+
     # Effective description coverage: raw coverage minus columns whose
     # descriptions are actively misleading (weak + copy-paste + contradicts
     # SQL) and columns that are "documented" in YAML but not emitted by SQL
@@ -3167,6 +3537,8 @@ def build_catalogs(models_dict, columns, concept_index, sql_data,
         'description_contradicts_sql': description_contradicts_sql,
         'effective_description_coverage': effective_coverage,
         'potential_unit_drift': potential_unit_drift,
+        'undefined_column_refs': undefined_column_refs,
+        'fan_out_joins': fan_out_joins,
         'phantom_columns_resolved_by_lineage': list(
             (issues or {}).get('phantom_columns_resolved_by_lineage') or []),
     }
@@ -3308,7 +3680,7 @@ def build_inventory(project_path):
     relationships = build_relationships(columns, models, sem_models)
 
     # Test summary
-    test_summary = build_test_summary(columns)
+    test_summary = build_test_summary(columns, models_dict=models)
 
     # Concept index
     concept_index = build_concept_index(models, columns)
@@ -3321,7 +3693,8 @@ def build_inventory(project_path):
     catalogs = build_catalogs(models, columns, concept_index, sd,
                               issues=issues, seeds=seeds,
                               project_root=project_path,
-                              manifest_used=manifest_has_compiled)
+                              manifest_used=manifest_has_compiled,
+                              dialect=dialect)
 
     # Count only true schema files (models/sources/etc.), not dbt_project.yml
     # or dbt_packages.yml sitting at project root.

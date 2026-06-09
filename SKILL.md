@@ -33,6 +33,7 @@ The audit is framed around **what an agent actually hits** (code evidence) vs **
 - **Phantom columns suppressed when evidence is weak.** If a model uses `dbt_utils.star`, `SELECT *` that can't be resolved, or Jinja for-loops, and no compiled manifest is present, the phantom finding is not emitted. It goes to `catalogs.phantom_columns_suppressed_no_manifest` instead. Synthesis emits one aggregate "run `dbt compile`" notice rather than per-model `provisional` rows. All rows in `phantom_columns_by_model` carry `confidence: 'high'` and are evidence-backed.
 - **Phantom columns traced through multi-hop CTEs and column lineage.** `_extract_columns_via_sqlglot` resolves CTE output columns recursively (depth 10), so a YAML column that survives through `base -> mid -> top` is not flagged phantom. When the simple YAML-vs-SQL diff still flags something, `cross_reference` retries via `sqlglot.lineage.lineage`; resolved findings land in `catalogs.phantom_columns_resolved_by_lineage` rather than `phantom_columns`. Unit / currency drift candidates (`col * 100`, `col / 100.0`, etc.) are collected into `catalogs.potential_unit_drift` for synthesis to treat as Blocker candidates when the description doesn't call out the conversion.
 - **`catalogs.description_contradicts_sql`** catches three high-signal failure modes deterministically: copy-paste descriptions, scope contradictions ("toutes les lignes" + non-trivial WHERE), and measure/agg mismatches ("count of customers" + `SUM(...)`).
+- **`catalogs.undefined_column_refs`** makes the worst query-fails bug deterministic: for every model, each SELECT scope (outer query + CTEs) is resolved against its input relations (CTEs recursively, ref'd models through their extracted columns); a column referenced in SELECT or GROUP BY that no input produces is flagged with `confidence: 'high'`. Scopes with any unresolvable input (macros, regex-fallback upstreams, sources) are skipped rather than guessed at. **`catalogs.fan_out_joins`** deterministically flags models joined by 2+ downstream models on a key with no `unique` test, each with a runnable verification query.
 - **`catalogs.effective_description_coverage`** reports raw vs effective coverage. Effective = raw minus weak / phantom-documented / contradicts-SQL columns. The gap is the share of docs an agent cannot trust.
 - **Severity, grain-declared, and zero-tests are not root issues.** Severity gets one line under Hygiene; grain-declared is informational unless the description is also silent on cardinality; zero-tests is appendix-only.
 - **"Safe today" criteria.** No Blocker flags, key columns agent-ready, no high-confidence phantoms, either has a PK test OR has 0 inbound refs, not a staging-only alternative to a core model. Grain qualifies via description text ("one row per customer per day") even without `meta.grain:`.
@@ -491,6 +492,7 @@ Collapse all findings into **Blockers** (code-evidenced, max 6) and **Hygiene** 
 
 1. **Collect all findings** from:
    - `inventory.issues.broken_refs` — always Blocker #1 when non-empty.
+   - `inventory.catalogs.undefined_column_refs` — always a Blocker candidate, ranked with broken_refs: the model references a column in SELECT or GROUP BY that no input CTE/ref produces, so the query fails at compile/run time. Every row is deterministic and carries `confidence: 'high'`; cite the row's `sql_path` and `scope`.
    - `inventory.catalogs.description_contradicts_sql` — each entry is a Blocker candidate (copy-paste, model_scope_contradiction, measure_agg_mismatch).
    - `inventory.catalogs.overlapping_concept_columns_within_model` — Blocker candidates.
    - `inventory.catalogs.enum_value_gaps.casing_mismatches` — Blocker candidates only when the drift is *in observed data* (not when one side is yaml-only).
@@ -499,11 +501,13 @@ Collapse all findings into **Blockers** (code-evidenced, max 6) and **Hygiene** 
    - Group 1 packet verdicts (confirmed / partially_confirmed) — Blocker candidates for scope divergence, polymorphism, same-word-different-definition.
    - Group 2 subagent outputs: description findings, naming findings (casing drift in data), join findings, semantic findings, business-terms findings.
    - `inventory.test_summary` + `inventory.relationships.implicit` — Hygiene candidates.
+   - `inventory.catalogs.fan_out_joins` — Hygiene candidates: 2+ downstream models join this model on a key with no `unique` test. Each row ships its own `verification_query`; emit it verbatim.
 
 2. **Classify each finding as Blocker or Hygiene.**
 
    A finding is a **Blocker** only if one of these is true:
    - A broken `ref()` exists (`issues.broken_refs`).
+   - An undefined column reference exists (`catalogs.undefined_column_refs`) — same rank as broken refs; the SQL cannot build.
    - The description demonstrably contradicts the SQL (copy-paste, scope, agg mismatch).
    - Two+ models give different SQL answers to the same conceptual question (packet verdict with confirmed severity).
    - A column is polymorphic across models (`entity_id`, `state`, etc.).
@@ -518,7 +522,8 @@ Collapse all findings into **Blockers** (code-evidenced, max 6) and **Hygiene** 
    - Undeclared grain when the description is silent on cardinality.
    - Suppressed phantom findings (`catalogs.phantom_columns_suppressed_no_manifest` non-empty). Model uses macros and no compiled manifest is present; re-run with `dbt compile` to resolve.
    - Project-wide `+severity: warn` default.
-   - Models with zero tests.
+   - Models with zero tests (use `test_summary.models_with_zero_tests_list` for the names).
+   - Fan-out joins (`catalogs.fan_out_joins`): the join exists and the unique test is missing, but whether duplicates actually occur needs the row's `verification_query` run against the warehouse.
 
 3. **Cluster Blockers by root cause** (max 6):
    - "Same-word-different-definition across models"
@@ -526,7 +531,7 @@ Collapse all findings into **Blockers** (code-evidenced, max 6) and **Hygiene** 
    - "Polymorphic keys / overloaded columns"
    - "Unit / currency drift"
    - "Within-model concept collision"
-   - "Broken refs" (always #1 when present)
+   - "Broken refs / undefined column references" (always #1 when present)
    - "Bilingual description corpus" (when >20% non-English)
 
 4. **For each Blocker (max 6), produce:**
@@ -632,6 +637,13 @@ Catalogs to surface when non-empty:
   contradictions" section in the report. Split by `kind`: copy_paste,
   model_scope_contradiction, measure_agg_mismatch. Each entry is a Blocker
   candidate and must be evaluated during synthesis.
+- `catalogs.undefined_column_refs` → "Undefined column references" appendix
+  table (model × column × clauses × scope × input relations). Every row is
+  also a Blocker candidate ranked with broken_refs — surface it in both
+  places.
+- `catalogs.fan_out_joins` → "Fan-out joins without a unique key test"
+  table under the Hygiene appendix (model × join column × downstream
+  models × verification query).
 - `catalogs.effective_description_coverage` → Coverage snapshot metric.
   Emit BOTH raw and effective percentages side-by-side. Effective = raw
   minus columns in weak / contradicts_sql / phantom_documented. The gap is

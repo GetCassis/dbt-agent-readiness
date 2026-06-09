@@ -116,6 +116,7 @@ Your entire response must be a single raw JSON object. Start with `{` and end wi
     "accepted_values_tests": 0,
     "other_tests": 0,
     "models_with_zero_tests": 0,
+    "models_with_zero_tests_list": ["model_a", "model_b"],
     "categorical_columns_without_accepted_values": ["model.column", "model.column"]
   },
 

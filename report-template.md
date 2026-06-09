@@ -234,6 +234,13 @@ YAML documents columns that the SQL doesn't produce. Each row carries a **confid
 
 Only `high`-confidence phantom findings are eligible for Blocker status. Provisional findings go in Hygiene with "re-run with `dbt compile` to confirm" as the verification step.
 
+**Undefined column references** (from `catalogs.undefined_column_refs`)
+Columns referenced in a SELECT list or GROUP BY that no input CTE/ref produces — the query fails at compile/run time. Every row is a Blocker candidate ranked with broken refs; also list it here for remediation.
+
+| Model | Column | Clauses | Scope | Input relations | SQL path |
+|---|---|---|---|---|---|
+| {model} | `{column}` | {select, group_by} | {cte name / final_select} | {relations} | {sql_path} |
+
 **Description contradicts SQL** (from `catalogs.description_contradicts_sql` — already emitted above, see "Per-model description contradictions")
 
 **Undocumented enum values** (from `catalogs.enum_value_gaps.undocumented_values`)
@@ -289,7 +296,14 @@ Cross-reference with phantom_columns_by_model. Skip if all flagged models appear
 
 ### Hygiene appendix: test gaps (non-blocking)
 
-**Models with zero tests** ({n}): {comma-separated list}.
+**Models with zero tests** ({n}): {comma-separated list from `test_summary.models_with_zero_tests_list`}.
+
+**Fan-out joins without a unique key test** (from `catalogs.fan_out_joins`)
+2+ downstream models join this model on a key nothing guarantees is unique — duplicate keys silently multiply joined rows. Run the verification query to turn the forecast into a ten-minute check.
+
+| Model | Join column | Joined by | Verification query |
+|---|---|---|---|
+| {model} | `{join_column}` | {downstream_models} | `{verification_query}` |
 
 **Missing PK tests on high-ref models**
 | Model | Inbound refs | Verification query |
