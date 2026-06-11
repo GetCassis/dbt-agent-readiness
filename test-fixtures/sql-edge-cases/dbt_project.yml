@@ -1,0 +1,5 @@
+name: 'sql_edge_cases'
+version: '1.0.0'
+config-version: 2
+profile: 'sql_edge_cases'
+model-paths: ["models"]
