@@ -1,0 +1,5 @@
+name: 'fan_out_joins'
+version: '1.0.0'
+config-version: 2
+profile: 'fan_out_joins'
+model-paths: ["models"]

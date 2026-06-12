@@ -1,0 +1,5 @@
+sql_edge_cases:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake

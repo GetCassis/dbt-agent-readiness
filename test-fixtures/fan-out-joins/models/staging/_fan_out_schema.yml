@@ -1,0 +1,43 @@
+version: 2
+
+models:
+  # Classic dbt_utils syntax: columns directly under the test config.
+  - name: dim_unique_combo
+    description: One row per region per day.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - region_id
+            - day
+
+  # Same tuple guarantee, but the downstreams only join on region_id.
+  - name: dim_subset_combo
+    description: One row per region per day.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - region_id
+            - day
+
+  # Newer dbt argument syntax (columns nested under arguments:). Defines the
+  # anchor that dim_anchor_combo reuses.
+  - name: dim_anchor_source
+    description: Source of the shared uniqueness test anchor.
+    data_tests: &combo_tests
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - region_id
+              - day
+
+  # Uniqueness test attached through a YAML anchor alias.
+  - name: dim_anchor_combo
+    description: One row per region per day.
+    data_tests: *combo_tests
+
+  # Genuine fan-out risk: no uniqueness guarantee on the join key.
+  - name: dim_no_test
+    description: One row per region.
+    columns:
+      - name: region_id
+        description: Region identifier (no unique test).
