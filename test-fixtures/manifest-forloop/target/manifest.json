@@ -1,0 +1,27 @@
+{
+  "metadata": {"dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json"},
+  "nodes": {
+    "model.fl.stg_payments": {
+      "name": "stg_payments",
+      "resource_type": "model",
+      "config": {"materialized": "view"},
+      "depends_on": {"nodes": []},
+      "columns": {},
+      "compiled_code": "select 1 as payment_id, 1 as order_id, 'credit_card' as payment_method, 10 as amount"
+    },
+    "model.fl.orders": {
+      "name": "orders",
+      "resource_type": "model",
+      "config": {"materialized": "table"},
+      "depends_on": {"nodes": ["model.fl.stg_payments"]},
+      "columns": {},
+      "compiled_code": "with order_payments as (\n    select\n        order_id,\n        sum(case when payment_method = 'credit_card' then amount else 0 end) as credit_card_amount,\n        sum(case when payment_method = 'coupon' then amount else 0 end) as coupon_amount,\n        sum(amount) as total_amount\n    from \"db\".\"main\".\"stg_payments\"\n    group by order_id\n)\nselect\n    order_id,\n    credit_card_amount,\n    coupon_amount,\n    total_amount\nfrom order_payments"
+    }
+  },
+  "sources": {},
+  "macros": {},
+  "docs": {},
+  "exposures": {},
+  "metrics": {},
+  "semantic_models": {}
+}

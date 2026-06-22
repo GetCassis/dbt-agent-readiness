@@ -22,6 +22,13 @@ Built for dbt teams piloting AI analysts, copilots, or internal data agents.
 - Grain undeclared when the description is also silent on cardinality
 - Macro-using models flagged for `dbt compile` when the manifest is missing
 
+**Optional docs mode** (context outside the dbt layer):
+- A doc defines a term one way and another doc defines it differently, with no authoritative dbt definition to settle it (Blocker)
+- A doc claims a model has a column it does not emit (Blocker when the model's YAML mirrors its SQL)
+- Models documented in prose vs models documented nowhere (coverage gap)
+- Docs pointing off-repo at Google Docs / Confluence / Notion / Slack an agent cannot read
+- Stale docs (deprecated markers, years-old dates)
+
 ## Sample output
 
 A Blocker from the bundled sample report:
@@ -75,6 +82,30 @@ Run the dbt-agent-readiness skill on /path/to/dbt/project
 
 The report is written to `{project_path}/dbt-agent-readiness.md`.
 
+### Optional: scan docs outside the dbt layer
+
+The audit is dbt-only by default. To also map the documentation that lives
+outside the dbt layer (repo `docs/`, runbooks, READMEs, a dropped `.md`), opt in:
+
+```
+Run dbt-agent-readiness on /path/to/dbt/project and include the docs
+```
+
+If your dbt project sits in a subdirectory of a larger repo, point it at the
+repo's documentation explicitly so docs above the project are included:
+
+```
+Run dbt-agent-readiness on ./transform/analytics and scan the docs in ./docs
+```
+
+Docs mode reports where context lives, where it duplicates the dbt layer, where
+a doc claims columns a model does not emit, where definitions disagree with no
+authoritative dbt fallback (those become Blockers), where docs go stale, and
+where they point off-repo at sources an agent cannot read (Google Docs,
+Confluence, Notion, Slack). It is deterministic-first: no documentation prose is
+sent to the model except short flagged snippets, so cost scales with findings,
+not doc volume.
+
 ## What the report contains
 
 1. **Readiness verdict**: ready / not ready / unsafe, with distance to ready.
@@ -113,6 +144,8 @@ report-template.md       Output report template
 phases/                  Phase subagent prompts
 scripts/inventory.py     Deterministic inventory (SQL, concepts, catalogs)
 scripts/dispatch_prep.py Review-packet generation, importance scoring
+scripts/docs_scan.py     Deterministic docs scan (optional docs mode)
+scripts/tests/           Regression gates for the deterministic checks
 examples/                Example audit reports
 test-fixtures/           Test projects for manual smoke testing
 CHANGELOG.md             Version history

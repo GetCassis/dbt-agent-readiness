@@ -21,6 +21,8 @@ Top risks are split into **Blockers (agent will hit this)** and **Hygiene (risk 
 
 **In plain terms:** {2-3 sentence summary. What would go wrong today. What's the path to ready.}
 
+**Agent grounding model:** this report reads findings for a *repo-grounded* agent by default, a coding or RAG agent handed the whole repo (Claude Code, Cursor, repo-RAG) that reads the dbt project, `docs/`, and READMEs together. A *metadata-grounded* agent, one that reads the dbt layer only, is the conservative subset. The two diverge on one case: a docs-vs-dbt contradiction on a term dbt already pins. There it is a Blocker for the repo-grounded agent (it sees both definitions and has no rule for which wins) and Hygiene for the metadata-grounded agent (it answers from the dbt layer). Those findings carry both labels.
+
 ## Blockers (agent will hit these today)
 
 Each entry is backed by code evidence: SQL, YAML, or a description that demonstrably contradicts the SQL. An agent querying the project today will produce wrong answers or fail.
@@ -54,6 +56,8 @@ A finding is a Blocker only if ONE of these is true in the code:
 - **Casing drift in actual data** (`'venueMap'` + `'venuemap'` both present). From `catalogs.enum_value_gaps.casing_mismatches`.
 - **Phantom columns** where `confidence == 'high'` (not gated by macro detection). From `catalogs.phantom_columns_by_model`.
 - **Deprecated columns still exposed** (glossary marks deprecated; mart still ships them).
+- **(docs mode) Doc-vs-code drift**: `docs_scan.column_drift` row with `confidence == 'high'` -- a doc claims a column the model does not emit, and the model's YAML mirrors its SQL. Code-evidenced.
+- **(docs mode) Multi-home contradiction**: a `differ` verdict (from Subagent F or inline synthesis) on a term that is a dbt identifier (`is_dbt_identifier == true`). For a repo-grounded agent this is a Blocker whether or not dbt pins the term: it reads dbt and docs together and has no rule for which definition wins. For a metadata-grounded agent it is a Blocker only when nothing pins the term (`authoritative_dbt_definition.exists == false`); when dbt pins it, that agent answers from the dbt layer, so it is Hygiene. Read `severity_if_differ` and label both. Default archetype: repo-grounded.
 
 If none of the above apply, the finding belongs under Hygiene or Appendix.
 
@@ -145,6 +149,52 @@ Models that would qualify after a single fix. Lead with the specific fix per row
 | Relationships declared / implicit | {r} / {i} (informational -- see Verification to-do) |
 
 **Why two coverage numbers?** Raw coverage counts any non-empty YAML description. Effective coverage subtracts columns whose descriptions are weak, copy-pasted, contradict the SQL, or describe phantom columns (documented in YAML but never emitted). The gap between raw and effective is the share of docs an agent cannot trust.
+
+{if docs_mode:}
+## Context beyond the dbt layer (docs scan)
+
+Maps the documentation that lives outside the dbt layer. The confirmed
+contradictions below also appear in Blockers (doc-vs-code drift, and every
+dbt-identifier multi-home `differ` for a repo-grounded agent) or Hygiene (a
+dbt-pinned multi-home `differ` for a metadata-grounded agent). This section is
+the full map. Severity follows the agent grounding model declared above.
+
+**Where context lives:** {n} docs scanned ({n} discovered, {n} dropped at cap, {n} dbt-layer files excluded). By type: {glossary n, runbook n, architecture n, onboarding n, process n, readme n, other n}.
+
+**Coverage (plain ratio, not a score):** {documented}/{total} models and source tables are described in docs.
+- Documented: {documented_list}
+- Not documented anywhere: {undocumented_list}
+
+**Duplicated homes** (from `multi_home_candidates` + verdicts from Subagent F or inline synthesis, `differ` only)
+
+| Term | Homes | Verdict | dbt pins it? | Repo-grounded | Metadata-grounded |
+|---|---|---|---|---|---|
+| `{identifier}` | {dbt description + N docs} | differ: {how} | {yes / no} | {Blocker / context} | {Hygiene / Blocker / context} |
+
+For each `differ` row, quote both conflicting snippets and read `severity_if_differ`. A dbt-identifier `differ` is a Blocker for a repo-grounded agent whether or not dbt pins the term. For a metadata-grounded agent it is a Blocker only when nothing pins it; when dbt pins it, that agent answers from the dbt layer, so it is Hygiene. A term that is not a dbt identifier is context for both.
+
+**Doc-vs-code drift** (from `column_drift` + `doc_column_verdicts`)
+
+| Doc | Model | Columns the doc claims the model lacks | Confidence | |
+|---|---|---|---|---|
+| {doc_path} | `{model}` | `{col}` | {high -> Blocker / provisional -> Hygiene} | {sql_path} |
+
+**Off-repo authority the agent cannot read** (from `external_pointers`)
+
+| Host | Count |
+|---|---|
+| {google_docs / confluence / notion / slack / airtable / ...} | {n} |
+
+Docs that defer authority offsite ("single source of truth" + external link): {defers_authority_offsite_docs}.
+
+**Staleness** (from `staleness_flags`)
+
+| Doc | Markers | Oldest date | Stale by date? |
+|---|---|---|---|
+| {path} | {deprecated, no longer maintained, ...} | {oldest_date} | {yes/no} |
+
+**Boundary note (verbatim):** this scan maps where context lives and where it duplicates or points away. It does not fully read prose to adjudicate every definition. Subagent F adjudicates the no-fallback multi-home candidates; synthesis adjudicates the dbt-pinned ones inline, bounded to the top ~15 by doc count. {if more dbt-pinned candidates remain beyond that bound: {n} dbt-pinned multi-home candidates were not adjudicated.} {if dropped_beyond_cap any: It also sampled. {n} multi-home, {n} column-claim, {n} classification rows were beyond the cap and not adjudicated.}
+{/if}
 
 {if strengths: ## What's working well}
 {2-4 bullets}
@@ -327,6 +377,7 @@ Top {k} by blast radius:
 - **BI tool metric conflicts** -- requires LookML or BI export access.
 - **Cross-database joins** -- joins spanning multiple databases are not analyzed.
 - **Macro-resolved column lists** (`dbt_utils.star()`, `SELECT *`, Jinja loops) -- phantom-column findings on these models are marked `provisional`. Running `dbt compile` and re-auditing against `target/manifest.json` resolves them.
+- **(docs mode) Full prose adjudication and off-repo content** -- the docs scan maps where context lives, duplicates, drifts, or points away, and adjudicates only the flagged snippets it extracts. It does not read every document end to end, and it never follows links, so the contents of Google Docs, Confluence, Notion, or Slack referenced by a doc are out of scope.
 
 ## Audit metadata
 
@@ -341,11 +392,12 @@ Top {k} by blast radius:
 | Subagents launched | {n} Group 1 + {n} Group 2 |
 | Phases completed | {list of completed phases} |
 | Inventory method | script {+ manifest.json if used} |
+| Docs scan | {off / on: n docs, n flagged rows adjudicated} |
 
 ---
 
 *Generated by the [dbt-agent-readiness](https://github.com/GetCassis/dbt-agent-readiness) skill for Claude Code.*
-*The problems this audit surfaces are what [Cassis](https://getcassis.com) solves automatically -- it builds and maintains your semantic ontology so agents always query the right data.*
+*The gaps this audit surfaces are what [Cassis](https://getcassis.com) addresses: a living context layer, bootstrapped from your existing assets and kept current from real use, so analytics agents query the right data. Every change is reviewed by your data team.*
 ```
 
 ---
@@ -357,6 +409,8 @@ Top {k} by blast radius:
 **A finding is a Blocker only with code evidence.** The evidence is one of: broken ref, scope divergence (description-vs-SQL), copy-paste description, measure/agg mismatch, polymorphic column, within-model concept collision, unit mismatch, deprecated-column-still-exposed, casing drift *in observed data*, or a high-confidence phantom column.
 
 **A finding is Hygiene when** it's a forecast that depends on runtime data (missing `unique` test on a PK, missing `relationships` test, missing `not_null`, missing `accepted_values` without observed drift). These get verification queries, not blast-radius language.
+
+**(docs mode) A multi-home `differ` carries conditional severity by agent grounding model**, not one fixed label. A dbt-identifier `differ` is a Blocker for a repo-grounded agent (the realistic default) whether or not dbt pins the term; it is Hygiene for a metadata-grounded agent only when dbt pins it. Read `severity_if_differ` on the candidate and label both. See the grounding-model note in the report header.
 
 **Provisional phantom columns** (`confidence == 'provisional'`) go to Hygiene with "re-run with `dbt compile`" as the verification step.
 

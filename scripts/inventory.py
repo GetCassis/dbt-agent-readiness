@@ -2738,12 +2738,26 @@ _MACRO_PATTERNS = [
     re.compile(r'\bfill_staging_columns\b', re.IGNORECASE),
     re.compile(r'\bget_columns_in_relation\b', re.IGNORECASE),
     re.compile(r'\bapply_source_relation\b', re.IGNORECASE),
+    # Custom column-spreading macros: a Jinja macro call whose name ends in
+    # `_columns(` (e.g. `select_extension_columns(ref(...))`) injects a column
+    # list the static parser cannot see. Common in package-style projects
+    # (Tuva, Fivetran) that assemble a canonical schema from a macro.
+    re.compile(r'\b\w*_columns\s*\(', re.IGNORECASE),
 ]
 _SELECT_STAR_RE = re.compile(
     r'\bSELECT\b\s+(?:/\*.*?\*/\s+)?(?:\w+\.)?\*(?:\s*,|\s+FROM)',
     re.IGNORECASE | re.DOTALL)
 _JINJA_FOR_SELECT_RE = re.compile(
     r"{%\s*for\b.*?%}.*?(?:select|,\s*\w+|as\s+\w+).*?{%\s*endfor\s*%}",
+    re.IGNORECASE | re.DOTALL)
+# `{%- set cols -%} ... {%- endset -%}` capture blocks expanded into a SELECT
+# via `{{ cols }}`. The static parser replaces the expansion with a Jinja
+# placeholder, so the captured column list is invisible and the YAML-vs-SQL
+# diff flags those columns as phantom when they are actually emitted. The
+# `endset` keyword is the reliable tell for a captured block (vs an inline
+# `{% set x = ... %}` config assignment, which has no endset).
+_JINJA_SET_BLOCK_RE = re.compile(
+    r"{%-?\s*set\s+\w+\s*-?%}.*?{%-?\s*endset\s*-?%}",
     re.IGNORECASE | re.DOTALL)
 
 # SQL date-part keywords. When one of these appears as a bare, unqualified
@@ -2833,6 +2847,8 @@ def _detect_macro_column_generation(sql, columns_resolved=False):
         signals.append('select_star')
     if _JINJA_FOR_SELECT_RE.search(sql):
         signals.append('jinja_for_loop')
+    if _JINJA_SET_BLOCK_RE.search(sql):
+        signals.append('jinja_set_block')
     return (bool(signals), signals)
 
 
@@ -3270,6 +3286,24 @@ _DESC_SUM_RE = re.compile(
 _DESC_AVG_RE = re.compile(
     r'\b(average|mean|moyenne)\b', re.IGNORECASE)
 
+# SQL keywords / operators that are not real column identifiers — stripped
+# before checking whether a WHERE clause's columns are disclosed in the prose.
+_WHERE_NOISE_TOKENS = frozenset([
+    'and', 'or', 'not', 'null', 'is', 'in', 'like', 'ilike', 'between',
+    'where', 'select', 'from', 'true', 'false', 'case', 'when', 'then',
+    'else', 'end', 'exists', 'as', 'on', 'coalesce', 'cast', 'lower',
+    'upper', 'current_date', 'current_timestamp', 'date', 'interval',
+])
+_WHERE_IDENT_RE = re.compile(r'[a-z_][a-z0-9_]{2,}')
+
+# A SUM whose argument is a 0/1 flag or boolean IS a count, so "description says
+# COUNT, SQL uses SUM" is not a real mismatch. These argument shapes mark that
+# case so it is not flagged.
+_FLAG_SUM_ARG_RE = re.compile(
+    r'(case\s+when|then\s+1\b|1\s+else\s+0|0\s+else\s+1|::\s*int|::\s*bool|'
+    r'\bcoalesce\b|\b\w*_flag\b|\bis_\w+|\bhas_\w+|\bflag\b|\bindicator\b|'
+    r'\bcnt\b|\bcount\b)', re.IGNORECASE)
+
 
 def _build_potential_unit_drift(sql_data):
     """Collect unit / currency drift candidates across all parsed models.
@@ -3343,6 +3377,16 @@ def _build_description_contradicts_sql(models_dict, columns, sql_data, issues):
         if not desc:
             continue
         if _DESC_ALL_RE.search(desc):
+            # If the description itself names the filter (the WHERE column
+            # appears in the prose), the scope is disclosed, not contradicted —
+            # e.g. "...all rows where disqualified_encounter_flag = 0". Don't
+            # flag a disclosed filter as a hidden scope contradiction.
+            wc = where_clauses[0]
+            where_idents = {t for t in _WHERE_IDENT_RE.findall(wc.lower())
+                            if t not in _WHERE_NOISE_TOKENS}
+            desc_l = desc.lower()
+            if any(tok in desc_l for tok in where_idents):
+                continue
             rows.append({
                 'kind': 'model_scope_contradiction',
                 'model': mname,
@@ -3399,6 +3443,10 @@ def _build_description_contradicts_sql(models_dict, columns, sql_data, issues):
         d_claims_avg = bool(_DESC_AVG_RE.search(desc))
         mismatch = None
         if agg_fn == 'SUM' and d_claims_count and not d_claims_sum:
+            # SUM of a 0/1 flag, boolean, or CASE WHEN ... THEN 1 IS a count,
+            # so this is not a real description-vs-SQL mismatch.
+            if _FLAG_SUM_ARG_RE.search(_inner):
+                continue
             mismatch = 'description says COUNT, SQL uses SUM'
         elif agg_fn == 'COUNT' and d_claims_sum and not d_claims_count:
             mismatch = 'description says SUM/total, SQL uses COUNT'
@@ -3679,8 +3727,15 @@ def build_catalogs(models_dict, columns, concept_index, sql_data,
     total_cols = len(columns) or 1
     documented_cols = sum(1 for c in columns if c.get('has_description'))
     weak_set = {(r['model'], r['column']) for r in weak_col_descs}
-    phantom_set = {(p['model'], p['column'])
-                   for p in (issues or {}).get('phantom_columns', []) or []}
+    # Only HIGH-confidence phantoms count against effective coverage. Models
+    # whose phantom findings were suppressed (macro / Jinja-set-block generated,
+    # no compiled manifest) are excluded by _build_phantom_by_model — their
+    # columns are documentation the static parser merely couldn't see, NOT
+    # genuinely-absent columns, so counting them would deflate the number with
+    # false positives on macro-heavy projects.
+    phantom_set = {(r['model'], col)
+                   for r in phantom_by_model
+                   for col in r.get('phantoms', []) or []}
     contradicting_set = set()
     for r in description_contradicts_sql:
         if r['kind'] == 'copy_paste':
@@ -3806,13 +3861,25 @@ def build_inventory(project_path):
         name = sf.stem
         sinfo = sd.get(name, {})
 
-        # If manifest has compiled_code, re-extract snippets from it
-        # (compiled code has Jinja resolved, so regexes work better)
+        # If manifest has compiled_code, re-extract snippets AND columns from
+        # it (compiled code has Jinja resolved, so regexes and the column
+        # parser work on the real output). Re-extracting columns matters for
+        # phantom detection: raw SQL with a Jinja for-loop such as
+        # `{{ pm }}_amount` strips to a single mangled `_amount` token, so the
+        # real generated columns look phantom even though the manifest resolves
+        # them. Only override when the compiled parse is confident (count > 0);
+        # otherwise keep the raw result rather than nuke a usable column set.
         snippets = sinfo.get('sql_snippets')
         if manifest and name in manifest:
             compiled = manifest[name].get('compiled_code')
             if compiled:
                 snippets = extract_sql_snippets(compiled)
+                c_names, c_count, _cm, _cr = extract_sql_columns_with_method(
+                    compiled, dialect=dialect)
+                if c_count and c_count > 0:
+                    sinfo['columns'] = c_names
+                    sinfo['column_count'] = c_count
+                    sd[name] = sinfo
 
         if name in models:
             m = models[name]

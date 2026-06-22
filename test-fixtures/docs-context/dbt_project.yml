@@ -1,0 +1,7 @@
+name: docs_context
+version: '1.0.0'
+config-version: 2
+profile: docs_context
+
+model-paths: ["models"]
+seed-paths: ["seeds"]

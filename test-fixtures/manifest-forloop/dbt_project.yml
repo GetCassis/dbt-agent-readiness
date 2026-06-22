@@ -1,0 +1,5 @@
+name: fl
+version: '1.0.0'
+config-version: 2
+profile: fl
+model-paths: ["models"]

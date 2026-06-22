@@ -127,6 +127,23 @@ Check if `{project_path}/dbt-agent-readiness.md` exists. If it does, read it and
 >
 > Reply with the file path, or "no" to proceed with just the dbt project.
 
+### 1f-bis. Determine docs mode (optional, default OFF)
+
+The audit is **dbt-only by default.** An optional docs-scan capability maps the
+documentation that lives *outside* the dbt layer (repo `docs/`, runbooks,
+READMEs, a dropped `.md`, or a user-pointed source) and reports where context
+duplicates, drifts from the code, goes stale, or points off-repo.
+
+Set `docs_mode = true` only when the user opts in — any of:
+- the invocation/request mentions docs/documentation ("include docs", "with
+  docs", "scan the docs", "docs mode", `--with-docs`), OR
+- the user provides a doc source path in reply to the glossary ask.
+
+If `docs_mode` is on and the user named doc sources, store them as
+`doc_sources`. Otherwise `doc_sources` stays empty (auto-discover). When
+`docs_mode` is false, skip Step 2d and the docs subagent entirely; the rest of
+the audit runs unchanged. Do NOT enable docs mode on your own initiative.
+
 ### 1g. Determine scope
 
 | Size | Behavior |
@@ -155,10 +172,17 @@ For projects with >100 models, present an estimate before starting inventory:
 > Proceed?
 
 **Estimation formulas:**
-- Inventory: `8 + 0.03 * total_models + 0.4 * n_priority` min
-- Deep pass: `max(8, min(15, n_priority * 0.4))` min
+- Inventory (script path, Step 2a): `~max(0.25, total_models / 2000)` min. The
+  deterministic script parses ~600 models in well under a minute (measured:
+  ~19s for 635 models on BigQuery). Only the LLM-fallback path (Step 2b) is
+  slow; if you must fall back, use `8 + 0.03 * total_models + 0.4 * n_priority`.
+- Deep pass: `max(8, min(15, n_priority * 0.4))` min — this and synthesis are
+  the real cost, not inventory.
 - Synthesis: 5 min
 - Total: sum + 2 min buffer
+
+The dominant cost is the deep-pass LLM fan-out, not inventory. Frame the
+estimate that way; do not quote a large inventory time for the script path.
 
 Wait for user confirmation before proceeding.
 
@@ -257,6 +281,54 @@ Store the result as `dispatch_prep` for downstream steps.
 
 **Hard cap:** The script already targets 25 packets max, merging the
 remainder into a single "miscellaneous" packet if needed.
+
+### 2d. Docs scan (deterministic, docs mode only)
+
+**Skip this step entirely if `docs_mode` is false.**
+
+Reuse the inventory JSON you already saved (do not re-parse the project). Run:
+
+```bash
+python3 {skill_dir}/scripts/docs_scan.py \
+  --project-path {project_path} \
+  --inventory /tmp/inventory-{project}.json \
+  --today {YYYY-MM-DD} \
+  {if doc_sources: --doc-sources {space-separated paths/globs}}
+```
+
+**Nested dbt projects:** auto-discover (no `--doc-sources`) scans the project
+path downward. When the dbt project sits in a subdirectory (`dbt_project.yml` is
+below the repo root, e.g. `transform/<project>/` or `warehouse/`), the most
+authoritative docs (repo `docs/`, `runbooks/`, top-level READMEs) live *above*
+it and would be missed. In that case pass `--doc-sources {repo_root}` (the git
+root you found in Step 1) so repo-level documentation is included; the dbt layer
+is still excluded by config, so the project's own schema docs are not double
+counted. Bump `--max-docs` (e.g. 300) on large repos so nothing is silently
+dropped.
+
+`--today` must be stamped by you (the run date), so staleness is reproducible.
+The script reuses `inventory.py` for the dbt identifier set and the project
+config, derives the dbt-layer boundary from every dbt-configured path plus
+`{% docs %}` block detection (so dbt's own docs and in-layer READMEs are never
+treated as external prose), then emits a single JSON object. No documentation
+prose enters any LLM context here. Capture it to `/tmp/docs-scan-{project}.json`
+and store as `docs_scan`.
+
+Key fields:
+- `identifier_coverage`: models/source-tables documented in docs vs not (a plain
+  ratio, never a score).
+- `column_drift`: docs claiming columns a model does not emit. Rows with
+  `confidence: high` (model YAML mirrors SQL output) are code-evidenced.
+- `multi_home_candidates`: identifiers with more than one home. Each carries
+  `is_dbt_identifier`, `authoritative_dbt_definition`, and `severity_if_differ`
+  (the conditional Blocker/Hygiene/context a confirmed `differ` would carry under
+  each agent grounding model: `repo_grounded` and `metadata_grounded`) — the
+  facts the reliability rule in Step 5b reads.
+- `external_pointers`, `staleness_flags`, `doc_corpus`, and `llm_queue` (the
+  hard-capped flagged subset for the docs subagent, with `dropped_beyond_cap`).
+
+If the script errors (non-zero, `"error"` key), note "docs scan unavailable" as
+one line and continue the dbt-only audit. Docs mode never blocks the audit.
 
 ---
 
@@ -358,6 +430,20 @@ Record the user's choice. If the user doesn't respond within the flow, proceed w
 
 **Skip any subagent whose phase doesn't apply** (e.g., skip semantic if inventory shows zero semantic models).
 
+**Model routing (cost).** Spawn ALL Group 1 and Group 2 subagents on **Sonnet**
+(the mechanical ones — naming, descriptions-rest — can use Haiku). They read a
+phase file plus a data slice and emit JSON; they do not need Opus. Keep Opus for
+the orchestrator's Step 5b/6 synthesis only. On a large project this is the
+single biggest cost lever — a cold Opus run pays Opus rates on every subagent.
+
+**Pass slices as files, not inline, on large projects.** The inventory can be
+multiple MB; inlining slices into prompts breaks. Write each subagent's slice to
+a temp JSON file and tell the subagent to Read it. **Cap the naming slice:** do
+NOT pass all columns — pass only the deterministic naming-drift candidates
+(`catalogs.convention_drift`, `same_name_different_grain`, `concept_variants`,
+`unprefixed_booleans`) plus the deep-pass-scope columns. Passing every column is
+the usual wall-clock bottleneck and largely re-derives those catalogs.
+
 **Output format rule for ALL subagents:** Append this to every subagent prompt:
 > Start your response with `{` and end with `}`. No text before the opening brace. No text after the closing brace. No markdown code fences. No commentary. Just the JSON.
 
@@ -447,6 +533,42 @@ Pass a focused slice, not the whole inventory -- keeps the subagent cheap:
 > {if glossary was provided: Glossary path: {absolute_path_to_glossary_file} -- read it yourself with the Read tool}
 > [append output format rule]
 
+#### Subagent F: Docs (docs mode only -- skip if `docs_mode` is false or if `docs_scan.llm_pass.recommended` is false)
+
+**Gate.** The deterministic scan decides whether this pass is worth running.
+`docs_scan.llm_pass.recommended` is now gated on **actionable** signals only:
+high-confidence column drift, a no-fallback multi-home contradiction, or doc
+column-claims to verify. A dictionary that simply agrees with the dbt layer is
+reported under `llm_pass.context_signals` (so it still appears in the docs map)
+but does NOT trigger the pass, because there is nothing for the LLM to
+adjudicate. Skip Subagent F entirely when `recommended == false`. When you skip,
+still emit the docs map (coverage, staleness, external pointers, generated-doc
+count, doc classification, and `context_signals`) and note `llm_pass.reasons` in
+the report. The scan's `llm_queue.multi_home` carries the no-fallback candidates
+only; do not send the dbt-pinned ones
+(`dropped_beyond_cap.multi_home_hygiene_only_not_sent`) to the subagent. They are
+not dropped, and they are not auto-Hygiene: Step 5b adjudicates them inline from
+the snippets on each `multi_home_candidate`, because a dbt-pinned `differ` is a
+Blocker for a repo-grounded agent (Hygiene only for a metadata-grounded one).
+Holding them off the subagent keeps its cost proportional; the inline pass runs
+in synthesis, which already holds the scan JSON. This inline pass runs whether or
+not Subagent F ran, so a repo whose only docs signal is dbt-pinned multi-home
+(gate `recommended == false`) still surfaces its repo-grounded Blockers.
+
+Light adjudication of the flagged rows the deterministic scan produced. This
+subagent sees only short snippets, never whole docs, and never follows links.
+
+> Read `{skill_dir}/phases/docs.md` and execute.
+> LLM queue from the docs scan:
+> ```json
+> {docs_scan.llm_queue}
+> ```
+> [append output format rule]
+
+Cost is bounded by the number of flagged rows (tens), independent of doc volume.
+Merge its `multi_home_verdicts`, `doc_column_verdicts`, and `doc_classifications`
+in synthesis.
+
 **Wait for all Group 1 + Group 2 subagents to complete.**
 
 ### Subagent result handling
@@ -458,7 +580,7 @@ wrap it as:
 
 ```json
 {
-  "subagent": "descriptions_priority" | "descriptions_rest" | "naming" | "joins" | "semantic" | "business_terms" | "review_packet_{i}",
+  "subagent": "descriptions_priority" | "descriptions_rest" | "naming" | "joins" | "semantic" | "business_terms" | "docs" | "review_packet_{i}",
   "start_ts": "<ISO 8601>",
   "end_ts": "<ISO 8601>",
   "result": { ...the subagent's parsed JSON... }
@@ -503,6 +625,9 @@ Collapse all findings into **Blockers** (code-evidenced, max 6) and **Hygiene** 
    - Group 2 subagent outputs: description findings, naming findings (casing drift in data), join findings, semantic findings, business-terms findings.
    - `inventory.test_summary` + `inventory.relationships.implicit` -- Hygiene candidates.
    - `inventory.catalogs.fan_out_joins` -- Hygiene candidates: 2+ downstream models join this model on a key with no uniqueness guarantee (no column `unique` test, no tested PK, and no `unique_combination_of_columns` tuple covering the join key). Each row ships its own `verification_query`; emit it verbatim.
+   - **(docs mode only)** `docs_scan.column_drift` -- rows with `confidence == 'high'` are Blocker candidates: a doc claims a column the model does not emit, and the model's YAML mirrors its SQL so the absence is real. `provisional` rows go to Hygiene. Cross-reference with Subagent F's `doc_column_verdicts`.
+   - **(docs mode only)** `docs_scan.multi_home_candidates`. Two adjudication paths feed this. (a) No-fallback candidates carry Subagent F's `multi_home_verdicts`. (b) dbt-pinned candidates (`authoritative_dbt_definition.exists == true`, which Subagent F never receives) are adjudicated here, inline: read the `sources` snippets on the candidate (the dbt description vs each doc home) and judge `agree` / `differ` / `can_t_tell` yourself, using the same calibration as `phases/docs.md` (only `differ` when you can name the inconsistency in scope, filter, grain, or measure; silence in one home is not disagreement; a bare identifier-name match is `can_t_tell`, not `differ` — a short or common name like `email`, `stage`, `status`, or `mode` appearing in an unrelated context, a different table, an infra or admin runbook, or a generic code-terminology note, is a homonym, so only `differ` when the doc defines the SAME object the dbt layer defines). Bound the inline pass to the top ~15 candidates by `doc_count`; if more remain, report the count under the boundary note instead of adjudicating all. For any candidate whose verdict (from either path) is `differ`, apply the reliability rule (step 2) to classify it. `agree` / `can_t_tell` verdicts are dropped.
+   - **(docs mode only)** `docs_scan.identifier_coverage`, `docs_scan.external_pointers`, `docs_scan.staleness_flags`, `docs_scan.doc_corpus` -- context/Hygiene candidates (coverage gaps, off-repo authority, stale docs, where context lives).
 
 2. **Classify each finding as Blocker or Hygiene.**
 
@@ -517,6 +642,11 @@ Collapse all findings into **Blockers** (code-evidenced, max 6) and **Hygiene** 
    - Casing drift observed in actual data (both variants appear in the column).
    - High-confidence phantom column (confidence==high).
    - Deprecated column still exposed in a mart.
+   - **(docs mode)** Doc-vs-code drift: `docs_scan.column_drift` row with `confidence == 'high'` (doc claims a column the model does not emit). Code-evidenced.
+   - **(docs mode)** A confirmed multi-home `differ` contradiction, classified by **agent grounding model** (state the assumption in the report's grounding-model note). Severity is conditional, not single-archetype. Read `severity_if_differ` on the candidate, which pre-computes both; label the finding with both severities rather than forcing one:
+     - **repo-grounded** (the realistic default): a coding or RAG agent handed the whole repo (Claude Code, Cursor, repo-RAG) reads the dbt project AND `docs/` AND READMEs, sees both sides of the contradiction, and has no rule for which wins. A `differ` is a **Blocker** here whenever the term is a dbt identifier (`is_dbt_identifier == true`), whether or not dbt pins it.
+     - **metadata-grounded** (the conservative subset): an agent that queries the dbt layer only. A `differ` is a **Blocker** here only when nothing pins the term (`is_dbt_identifier == true` AND `authoritative_dbt_definition.exists == false`); when dbt pins it, that agent answers from the dbt layer, so it is **Hygiene** for this archetype.
+     So a no-fallback `differ` is a Blocker for both; a dbt-pinned `differ` is a Blocker for repo-grounded, Hygiene for metadata-grounded. Cite the two conflicting snippets either way.
 
    A finding is **Hygiene** if it's a forecast whose realization the audit can't confirm without querying the warehouse:
    - Missing `unique` / `not_null` / `relationships` / `accepted_values` tests.
@@ -525,6 +655,10 @@ Collapse all findings into **Blockers** (code-evidenced, max 6) and **Hygiene** 
    - Project-wide `+severity: warn` default.
    - Models with zero tests (use `test_summary.models_with_zero_tests_list` for the names).
    - Fan-out joins (`catalogs.fan_out_joins`): the join exists and the unique test is missing, but whether duplicates actually occur needs the row's `verification_query` run against the warehouse.
+   - **(docs mode)** A dbt-pinned multi-home `differ` contradiction (`authoritative_dbt_definition.exists == true`) is Hygiene **only for a metadata-grounded agent**: that agent answers from the dbt layer, so the conflicting prose is stale duplication, not an answer-breaker. For a repo-grounded agent the same finding is a Blocker (see the Blocker rule above). Carry both labels.
+   - **(docs mode)** `provisional` `column_drift` rows (model's column set only partially known).
+   - **(docs mode)** Off-repo authority (`external_pointers`: Google Docs, Confluence, Notion, Slack the agent cannot read), stale docs (`staleness_flags`), and coverage gaps (`identifier_coverage` undocumented list). These are context/Hygiene: they map where context lives and what an agent cannot see, not a code failure.
+   - **(docs mode)** A `differ` contradiction on a term that is NOT a dbt identifier (`is_dbt_identifier == false`): context only, for both archetypes -- neither agent queries it as a dbt object.
 
 3. **Cluster Blockers by root cause** (max 6):
    - "Same-word-different-definition across models"
@@ -660,6 +794,23 @@ Catalogs to surface when non-empty:
 Root issues should reference catalogs when relevant ("see Appendix: phantom
 columns"), not duplicate them inline.
 
+**Docs mode only.** When `docs_mode` is on, add the "Context beyond the dbt layer
+(docs scan)" section from `report-template.md`, fed by `docs_scan`, Subagent F's
+verdicts (no-fallback candidates), and your inline verdicts (dbt-pinned
+candidates): where context lives (doc count, classified), coverage gaps (exact
+documented/undocumented lists), duplicated homes (multi-home `differ` verdicts
+with both snippets, classified by the conditional reliability rule), off-repo
+authority (counts + hosts), and staleness. State the **agent grounding model**
+note from `report-template.md` so the report declares its assumption: repo-grounded
+is the realistic default, metadata-grounded the conservative subset. Promote
+high-confidence `column_drift` into the Blockers section; promote every dbt-identifier
+`differ` contradiction (no-fallback and dbt-pinned) into Blockers for a repo-grounded
+agent, and label the dbt-pinned ones Hygiene for a metadata-grounded agent.
+Include the boundary note verbatim: the scan maps where context lives and where
+it duplicates or points away; it does not fully read prose to adjudicate every
+definition. Surface the caps and `dropped_beyond_cap` so nothing reads as
+complete coverage when it was sampled.
+
 ### 6a. Calibrate tone
 
 If the project is well-maintained (high coverage, consistent naming, strong tests), lead with what's done well. Don't make a clean project sound broken.
@@ -704,4 +855,5 @@ Do not dump the full report into the conversation.
 Delete any temporary files created during the audit:
 - `{project_path}/inventory.json` or similar inventory dump files
 - `/tmp/inventory-*.json` files
+- `/tmp/docs-scan-*.json` files (docs mode)
 - Any other intermediate files written during subagent execution

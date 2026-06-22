@@ -1,0 +1,40 @@
+version: 2
+
+models:
+  - name: dim_customers
+    description: "One row per customer with profile and contact attributes."
+    columns:
+      - name: customer_id
+        description: "Surrogate key for the customer."
+        data_tests:
+          - unique
+          - not_null
+      - name: customer_name
+        description: "Customer full name."
+      - name: customer_email
+        description: "Primary contact email address."
+      - name: signup_date
+        description: "Date the customer account was created."
+
+  - name: fct_orders
+    description: "One row per order placed by a customer."
+    columns:
+      - name: order_id
+        description: "Surrogate key for the order."
+        data_tests:
+          - unique
+          - not_null
+      - name: customer_id
+        description: "Customer who placed the order."
+      - name: order_amount
+        description: "Gross order amount in USD."
+      - name: order_status
+        description: "Order lifecycle status."
+
+  # fct_revenue is deliberately left without a model-level description and with
+  # undescribed columns: the dbt layer gives an agent no authoritative
+  # definition, so a doc-vs-doc disagreement on it has no reliable fallback.
+  - name: fct_revenue
+    columns:
+      - name: revenue_date
+      - name: revenue_amount
