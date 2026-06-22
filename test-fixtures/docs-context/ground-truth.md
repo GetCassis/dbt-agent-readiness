@@ -50,3 +50,17 @@ Run the external docs through the scanner with `--doc-sources docs` and
 `models/README.md` and `models/_models_docs.md` (a `{% docs %}` block file) live
 inside the model path. Under auto-discovery they must be excluded from the
 external corpus (`dbt_layer_excluded >= 2`), never scanned as prose.
+
+## Home precision (docs_scan 1.5)
+
+A doc *homes* an identifier only in a definitional context (heading subject,
+column-dictionary row key, "`x` is/means …" prose, or a glossary entry). A bare
+reference does not. Two planted dirs prove this, scanned with `--doc-sources`:
+
+- `home-precision/bare/runbook.md` mentions `dim_customers` only in bare
+  contexts — a fenced SQL query, a checklist table cell, and a code-terminology
+  colon-list. `dim_customers` must be *mentioned* but must NOT home, so it is
+  NOT a `multi_home_candidate` even though the dbt layer pins it.
+- `home-precision/real/glossary.md` defines `dim_customers` in a glossary entry.
+  It homes, so `dim_customers` IS a `multi_home_candidate` (one doc home + the
+  authoritative dbt definition).

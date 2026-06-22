@@ -19,7 +19,10 @@ expected answer. Guessing is worse than abstaining.
 
 You receive the `llm_queue` object from the docs-scan JSON (already hard-capped):
 
-- `multi_home`: identifiers with more than one home. Each carries `identifier`,
+- `multi_home`: identifiers with more than one home, where a *home* is a doc
+  that DEFINES the term (a heading subject, a column-dictionary row, a "`x`
+  is/means …" definition, or a glossary entry), not one that merely mentions it
+  in prose, SQL, or a checklist. Each carries `identifier`,
   `kind`, `is_dbt_identifier`, `authoritative_dbt_definition` (`exists`,
   `source`, `quality`), `doc_count`, and `sources` (each `origin` of
   `dbt_description` or `doc`, with a `ref` and a short `snippet`).

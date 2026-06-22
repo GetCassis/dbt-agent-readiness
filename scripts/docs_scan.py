@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""docs_scan.py — optional documentation scanner for dbt-agent-readiness (scanner v1.2).
+"""docs_scan.py — optional documentation scanner for dbt-agent-readiness (scanner v1.5).
 
 Deterministic (near-zero-token) scan of documentation that lives OUTSIDE the
 dbt layer: repo `docs/`, runbooks, READMEs, or user-pointed `.md/.mdx/.rst/.txt`
@@ -52,7 +52,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import inventory as inv  # noqa: E402  (reuse helpers + build_inventory)
 
-DOCS_SCAN_VERSION = '1.4'  # multi_home_candidate carries severity_if_differ
+DOCS_SCAN_VERSION = '1.5'  # a doc HOMES an identifier only in a definitional
+#                             context (heading subject, column-dictionary row,
+#                             "`x` is/means …" prose, or a glossary entry); a
+#                             bare mention in prose, SQL, a checklist/metadata
+#                             table, or an infra/setup doc no longer counts, so
+#                             multi_home is a high-signal set. v1.4 =
+#                             multi_home_candidate carries severity_if_differ
 #                             (conditional Blocker/Hygiene per agent grounding
 #                             model); v1.3 limited column-claim extraction to
 #                             column-dictionary tables (generic Property|Value
@@ -131,7 +137,6 @@ AS_OF_RE = re.compile(
 # Markdown headings and tables.
 H1_RE = re.compile(r'^\#\s+(.+?)\s*$', re.M)
 HEADING_RE = re.compile(r'^(\#{1,6})\s+(.+?)\s*$', re.M)
-MD_TABLE_ROW_RE = re.compile(r'^\s*\|(.+)\|\s*$', re.M)
 FENCE_RE = re.compile(r'```[\w]*\n(.*?)```', re.DOTALL)
 
 # snake_case / column-like tokens (>=2 chars, must contain a lowercase letter).
@@ -145,21 +150,44 @@ COVERAGE_STOPWORDS = frozenset([
     'true', 'false', 'null', 'all', 'the', 'and', 'for', 'with',
 ])
 
-# Doc types that can define data semantics. Onboarding/process/changelog and
-# tutorial prose name data only incidentally, so a snake_case prose match there
-# is treated as noise unless the token also appears in a strong claim context.
-DATA_BEARING_DOC_TYPES = frozenset(
-    ['glossary', 'architecture', 'runbook', 'readme', 'other'])
+# ── Definitional-home signals ────────────────────────────────────────────────
+# A doc *homes* an identifier only when it DEFINES it, not when it merely uses
+# the word. Four definitional contexts (see `_definitional_homes`): the term is
+# a heading's subject, a column-dictionary row key, the subject of a "`x`
+# is/means …" prose definition, or a glossary/data-dictionary entry. A bare
+# occurrence in prose, SQL, a checklist/metadata table cell, or an infra/setup
+# doc is NOT a home — that is the difference between "the doc documents this
+# field" and "the doc happens to use the word."
 
-# Strong "this is a field/table, not the English word" signals: a backticked
-# token, a token right after a claim keyword, a markdown table cell, or a token
-# inside a fenced code block. Used to decide whether a doc actually *homes* an
-# identifier vs merely uses the word.
-BACKTICK_IDENT_RE = re.compile(r'`\s*([a-z][a-z0-9_]+)\s*`')
-CLAIM_KEYWORD_RE = re.compile(
-    r'\b(?:column|field|table|metric|measure|attribute|dimension|model|'
-    r'defined as|represents?|refers? to|is the|denotes?)\b[\s:]*`?'
-    r'([a-z][a-z0-9_]+)`?', re.I)
+# Glossary entry: a bulleted term followed by ":" / em-dash and its definition
+# ("- **fct_revenue**: gross revenue …"). Counted only in glossary-typed docs;
+# the same shape in a README ("- `email`: the user's email") is code
+# terminology, a homonym source, not a data home.
+GLOSSARY_ENTRY_RE = re.compile(
+    r'^\s*[-*+]\s+(?:\*\*|__|`)?\s*([a-z][a-z0-9_]+)\s*(?:\*\*|__|`)?\s*[:—]',
+    re.M | re.I)
+
+# Term-first prose definition: a backticked identifier directly followed by a
+# *definitional* verb ("`fct_revenue` means net revenue", "`x` is defined as …").
+# Bare "is"/"are" are excluded on purpose — "`subscription_id` is not null" in a
+# changelog is a predicate, not a definition; only verbs that introduce a meaning
+# count. The backtick + verb adjacency separates a real definition from a bare
+# mention ("a `stage` has to be created") or a colon list ("- `email`: …").
+PROSE_DEFN_RE = re.compile(
+    r'`([a-z][a-z0-9_]+)`\s+(?:is\s+defined\s+as|defined\s+as|means?\b|'
+    r'represents?\b|refers?\s+to\b|denotes?\b|stands?\s+for\b)',
+    re.I)
+
+# Words that may sit beside an identifier in a heading without disqualifying it
+# as the heading's subject — "## The dim_customers table" is still about
+# dim_customers. Any other significant word means the heading is about something
+# else ("## Email configuration settings"), so it homes nothing.
+_HEADING_DESCRIPTORS = frozenset([
+    'the', 'a', 'an', 'and', 'or', 'vs', 'versus', 'model', 'models', 'table',
+    'tables', 'column', 'columns', 'field', 'fields', 'source', 'sources',
+    'overview', 'details', 'detail', 'definition', 'definitions', 'schema',
+    'spec', 'reference',
+])
 
 SNIPPET_LEN = 240
 
@@ -387,39 +415,78 @@ def _extract_doc_column_claims(text: str, model_names: set[str]):
     return claims
 
 
-def _extract_claim_tokens(text: str) -> set:
-    """Tokens that appear in a *definitional* context — backticks, a claim
-    keyword ("column X", "represents X"), a markdown table cell, or a fenced
-    code block. A bare prose occurrence of a common word (`city`, `areas`,
-    `stops`) is NOT a claim; this is what separates "the doc documents this
-    field" from "the doc happens to use the word."
-    """
-    toks: set = set()
-    for m in BACKTICK_IDENT_RE.finditer(text):
-        toks.add(m.group(1).lower())
-    for m in CLAIM_KEYWORD_RE.finditer(text):
-        toks.add(m.group(1).lower())
-    for row in MD_TABLE_ROW_RE.finditer(text):
-        for cell in row.group(1).split('|'):
-            c = cell.strip().strip('`').strip()
-            if re.fullmatch(r'[a-z][a-z0-9_]+', c):
-                toks.add(c.lower())
-    for fence in FENCE_RE.finditer(text):
-        for t in IDENT_TOKEN_RE.finditer(fence.group(1)):
-            toks.add(t.group(1).lower())
-    return toks
+def _heading_subject(title: str) -> str | None:
+    """The single identifier a heading is *about* (lowercased), or None. A
+    heading homes an identifier only when the identifier IS its subject —
+    "## fct_orders", "## The dim_customers table" — not when it merely appears
+    inside a longer descriptive title ("## Email configuration settings")."""
+    words = re.findall(r'[a-z][a-z0-9_]*', title.lower())
+    significant = {w for w in words if w not in _HEADING_DESCRIPTORS}
+    if len(significant) != 1:
+        return None
+    tok = next(iter(significant))
+    return tok if len(tok) >= 4 else None
 
 
-def _is_doc_home(token: str, tok_l: str, claim_tokens: set, doc_type: str) -> bool:
-    """Does this doc actually *home* the identifier (define/reference it as a
-    data object), vs merely mention the word? Single-word tokens must appear in
-    a strong claim context; snake_case tokens are distinctive enough that a bare
-    match in a data-bearing doc is a real reference."""
-    if tok_l in claim_tokens:
-        return True
-    if '_' in token and doc_type in DATA_BEARING_DOC_TYPES:
-        return True
-    return False
+def _column_dict_row_keys(text: str) -> set:
+    """First-cell keys of markdown column-dictionary tables (`| customer_id | …`).
+    Mirrors `_extract_column_table_claims`' table handling but excludes fenced
+    code and generic key/value tables (`| Property | Value |`); used only for
+    home detection. A row key is a defining context: the table is the column's
+    data dictionary, keyed to it."""
+    keys: set = set()
+    lines = text.split('\n')
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if '|' in line and i + 1 < n:
+            header = _md_cells(line)
+            sep = _md_cells(lines[i + 1])
+            if (len(header) >= 2 and len(sep) == len(header)
+                    and _is_md_sep_row(sep) and _is_column_table_header(header)):
+                j = i + 2
+                while j < n and '|' in lines[j] and lines[j].strip().startswith('|'):
+                    cells = _md_cells(lines[j])
+                    first = cells[0].lower() if cells else ''
+                    if (first and first not in ('column', 'field', 'name', 'col')
+                            and re.fullmatch(r'[a-z][a-z0-9_]+', first)):
+                        keys.add(first)
+                    j += 1
+                i = j
+                continue
+        i += 1
+    return keys
+
+
+def _definitional_homes(text: str, doc_type: str) -> set:
+    """Tokens (lowercased) the doc actually *defines*, vs merely mentions.
+
+    A doc homes an identifier only in a definitional context:
+      1. the identifier is a heading's subject ("## fct_orders");
+      2. it is the row key of a column-dictionary table;
+      3. it is the term of a "`x` is/means/represents …" prose definition;
+      4. it is a glossary/data-dictionary entry ("- **x**: …"), counted only in
+         a doc whose job is defining terms — a bullet "- `email`: …" inside a
+         README/runbook is code terminology, not a data home.
+
+    Fenced code is stripped first, so a query selecting a column or a setup
+    snippet exporting a variable is a *use*, never a home. A bare mention in
+    prose, a backtick, a checklist/metadata table cell, or SQL does NOT home the
+    identifier. This is what shrinks multi_home from a noisy bare-occurrence
+    population to the docs that genuinely compete with dbt for a definition."""
+    prose = FENCE_RE.sub('\n', text)
+    homes: set = set()
+    for h in HEADING_RE.finditer(prose):
+        tok = _heading_subject(h.group(2))
+        if tok:
+            homes.add(tok)
+    homes |= _column_dict_row_keys(prose)
+    for m in PROSE_DEFN_RE.finditer(prose):
+        homes.add(m.group(1).lower())
+    if doc_type == 'glossary':
+        for m in GLOSSARY_ENTRY_RE.finditer(prose):
+            homes.add(m.group(1).lower())
+    return homes
 
 
 # ── Boundary: what counts as "the dbt layer" ─────────────────────────────────
@@ -782,7 +849,9 @@ def scan(project_path: Path, inventory: dict, *, doc_sources=None,
 
         # Identifier mentions, split into bare mentions (the coverage map) and
         # definitional homes (the multi-home signal the LLM eventually sees).
-        claim_tokens = _extract_claim_tokens(text)
+        # Coverage counts any mention; only a definitional home creates a
+        # doc-vs-dbt contradiction, so multi_home filters on `home`.
+        doc_homes = _definitional_homes(text, doc_type)
         mentions = []
         for tok, rx in scan_res.items():
             m = rx.search(text)
@@ -791,7 +860,7 @@ def scan(project_path: Path, inventory: dict, *, doc_sources=None,
                 tl = tok.lower()
                 term_doc_hits.setdefault(tl, []).append({
                     'doc_path': rel, 'snippet': _snippet(text, m.start()),
-                    'home': _is_doc_home(tok, tl, claim_tokens, doc_type)})
+                    'home': tl in doc_homes})
         mentions.sort()
 
         claims = [] if generated else _extract_doc_column_claims(text, model_names)

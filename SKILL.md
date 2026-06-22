@@ -319,7 +319,10 @@ Key fields:
   ratio, never a score).
 - `column_drift`: docs claiming columns a model does not emit. Rows with
   `confidence: high` (model YAML mirrors SQL output) are code-evidenced.
-- `multi_home_candidates`: identifiers with more than one home. Each carries
+- `multi_home_candidates`: identifiers with more than one home, where a *home*
+  is a definitional context (a heading subject, a column-dictionary row, a "`x`
+  is/means …" definition, or a glossary entry) — not a bare mention in prose,
+  SQL, a checklist table, or an infra/setup doc. Each carries
   `is_dbt_identifier`, `authoritative_dbt_definition`, and `severity_if_differ`
   (the conditional Blocker/Hygiene/context a confirmed `differ` would carry under
   each agent grounding model: `repo_grounded` and `metadata_grounded`) — the

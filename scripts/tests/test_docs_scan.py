@@ -1,4 +1,4 @@
-"""Regression tests for the docs-scan capability (v1.4.0).
+"""Regression tests for the docs-scan capability (v1.5.0).
 
 Deterministic gate over the planted `test-fixtures/docs-context/` project. Pins
 Layer-1 detection of every planted signal: coverage gap, doc-vs-code column
@@ -175,6 +175,77 @@ results.append(case(
     and not any('_models_docs' in p for p in scanned_paths)
     and auto['doc_corpus']['dbt_layer_excluded'] >= 2,
     f"scanned={scanned_paths} excluded={auto['doc_corpus']['dbt_layer_excluded']}"))
+
+# ── 10. Home precision (docs_scan 1.5): a doc HOMES an identifier only in a ──
+# definitional context. A bare reference — a fenced-SQL mention, a
+# checklist/metadata table cell, a backtick in prose, or an infra-doc
+# terminology colon-list — does NOT home it. This is the precision fix that
+# shrinks multi_home from a noisy bare-occurrence population to the docs that
+# actually compete with dbt for a definition.
+H = ds._definitional_homes
+
+# Definitional homes — MUST be detected.
+results.append(case(
+    "home: heading whose subject is the identifier",
+    'fct_orders' in H("## fct_orders\nHow the orders mart is built.", 'readme')))
+results.append(case(
+    "home: 'The X table' heading still names its subject",
+    'dim_customers' in H("### The dim_customers table\n", 'architecture')))
+results.append(case(
+    "home: column-dictionary row key",
+    'order_total' in H("| Column | Description |\n|---|---|\n"
+                       "| order_total | total value |\n", 'readme')))
+results.append(case(
+    "home: '`x` means …' prose definition",
+    'fct_revenue' in H("For finance, `fct_revenue` means net revenue.", 'other')))
+results.append(case(
+    "home: glossary entry in a glossary-typed doc",
+    'fct_revenue' in H("- **fct_revenue**: gross revenue including refunds.",
+                       'glossary')))
+
+# Bare references — MUST NOT be homes (the real-evidence homonym population).
+_sql = ("## Performance\nExample query:\n```sql\nselect credits_used, account_name\n"
+        "from warehouse_metering_history\n```\n")
+_sql_homes = H(_sql, 'runbook')
+results.append(case(
+    "bare: a column named only inside fenced SQL is NOT a home",
+    'credits_used' not in _sql_homes and 'account_name' not in _sql_homes,
+    f"homes={sorted(_sql_homes)}"))
+_checklist = ("## New data source\n| Task | Owner |\n|---|---|\n"
+              "| Add kpi_status to sheets.yml | you |\n")
+results.append(case(
+    "bare: a checklist/metadata table cell is NOT a home",
+    'kpi_status' not in H(_checklist, 'readme'),
+    f"homes={sorted(H(_checklist, 'readme'))}"))
+_termlist = ("### Additional development notes\nUseful terminology in the code:\n"
+             "- `email`: The email of the user.\n- `username`: The Snowflake username.\n")
+_term_homes = H(_termlist, 'readme')
+results.append(case(
+    "bare: a code-terminology colon-list in a README is NOT a home",
+    'email' not in _term_homes and 'username' not in _term_homes,
+    f"homes={sorted(_term_homes)}"))
+results.append(case(
+    "bare: a backtick mention ('a `stage` has to be created') is NOT a home",
+    'stage' not in H("When productionalizing, a `stage` has to be created on "
+                     "Snowflake.", 'runbook')))
+results.append(case(
+    "bare: a common word inside a longer heading is NOT a home",
+    'email' not in H("## Email configuration settings\n", 'readme')))
+
+# Fixture-level: the same identifier is a home when defined, not when bare-only.
+bare = ds.scan(FIXTURE, inventory, doc_sources=['home-precision/bare'], today=TODAY)
+bare_mh = {m['identifier'] for m in bare['multi_home_candidates']}
+results.append(case(
+    "fixture: dbt-pinned dim_customers is NOT multi-home when only bare-referenced",
+    'dim_customers' in [d for doc in bare['doc_corpus']['docs']
+                        for d in doc['identifier_mentions']]
+    and 'dim_customers' not in bare_mh,
+    f"candidates={sorted(bare_mh)}"))
+real = ds.scan(FIXTURE, inventory, doc_sources=['home-precision/real'], today=TODAY)
+real_mh = {m['identifier'] for m in real['multi_home_candidates']}
+results.append(case(
+    "fixture: dim_customers IS multi-home when a glossary defines it",
+    'dim_customers' in real_mh, f"candidates={sorted(real_mh)}"))
 
 print()
 failed = sum(1 for r in results if not r)

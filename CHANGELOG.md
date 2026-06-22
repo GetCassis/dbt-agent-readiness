@@ -2,6 +2,57 @@
 
 All notable changes to the dbt-agent-readiness skill.
 
+## 1.6.1 (2026-06-22)
+
+Precision follow-up to the 1.6.0 conditional-severity rework. 1.6.0 routes
+dbt-pinned multi-home contradictions to adjudication (repo-grounded Blocker vs
+metadata-grounded Hygiene); validation on the 13 public blog repos showed that
+population was 618 candidates but almost entirely noise. The old `home` heuristic
+counted a bare identifier-name occurrence as a definitional home — a column in a
+runbook SQL query, a README file-format table, an onboarding checklist — and
+short names produced false homonyms (cagov matched `account_name` / `schema_name`
+/ `credits_used` against Snowflake admin SQL; gitlab `stage` against a "Snowflake
+stage object" runbook note; `email` / `username` against a code-terminology
+README list). Adjudicating 257 of the 618 found zero genuine docs-vs-dbt
+contradictions.
+
+- **A doc HOMES an identifier only in a definitional context (docs_scan.py).**
+  `_is_doc_home` (a bare-token match against backticks, any table cell, or any
+  fenced-code token) is replaced by `_definitional_homes`, which counts a home
+  only when the doc DEFINES the term: the identifier is a heading's subject
+  (`## fct_orders`), a column-dictionary row key, the subject of a "`x`
+  is/means/represents …" prose definition, or a glossary entry. The glossary case
+  is counted only in a glossary-typed doc — a colon-list bullet like `- email: …`
+  in a README is code terminology, not a data home. Fenced code is stripped
+  first, so a query selecting a column or a setup snippet exporting a variable is
+  a *use*, never a home. A bare mention in prose, a backtick, or a
+  checklist/metadata table cell no longer homes the identifier.
+- **Population shrunk from noise to signal.** Across the 13 blog repos, total
+  multi_home candidates dropped 633 → 116 and the dbt-pinned population that
+  1.6.0 routes to adjudication dropped 618 → 116 (−82%); the no-fallback
+  (Blocker-eligible, LLM-queue) population dropped 15 → 0. Per-repo (before →
+  after): gitlab 41→4, cal-itp 82→4, tuva 250→37, stripe 90→0, full-funnel
+  61→43, ga4 25→17, salesforce 21→0, snowplow 19→10, gtm-analytics 17→0, cagov
+  11→0, jaffle_corp 8→0, jaffle_shop 7→0, mattermost 1→1. Every survivor
+  inspected is a genuine definitional home — a column-dictionary table, a
+  model-overview README table, or a metrics table — not a bare reference.
+- **docs_scan bumped to 1.5.** The output shape is unchanged; only which mentions
+  carry `home: true` changed, so `multi_home_candidates`, the LLM queue, and the
+  `dropped_beyond_cap` counts all narrow to the high-signal set. Identifier
+  coverage, column drift, external pointers, and staleness are computed from
+  mentions (not homes) and are unaffected.
+
+Pairs with 1.6.0: that change routes dbt-pinned multi-home to adjudication; this
+change makes that routed population small and high-signal. The two are intended
+to ship to the public repo together as one consolidated release.
+
+Test suite 114 → 126 (12 home-precision assertions in `tests/test_docs_scan.py`
+asserting that a fenced-SQL mention, a checklist-table cell, a code-terminology
+colon-list, and a bare backtick are NOT homes while a heading subject,
+column-dictionary row, prose definition, and glossary entry are; plus planted
+`test-fixtures/docs-context/home-precision/` fixtures). The public repo is
+untouched.
+
 ## 1.6.0 (2026-06-22)
 
 Reliability rule reworked from a single archetype to **conditional severity by
