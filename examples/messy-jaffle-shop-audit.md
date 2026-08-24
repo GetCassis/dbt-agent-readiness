@@ -1,9 +1,9 @@
 # dbt-agent-readiness: messy_jaffle_shop
 
-**Scanned:** 10 models | **Date:** 2026-04-20
-**Source:** YAML + raw SQL (manifest not compiled — phantom-column findings flagged provisional)
+**Scanned:** 10 models | **Date:** 2026-08-24
+**Source:** YAML + raw SQL (manifest not compiled)
 
-> This is the output of running the skill against the bundled [`test-fixtures/messy-jaffle-shop`](../test-fixtures/messy-jaffle-shop) project. Use it to see what an audit report looks like before installing.
+> This example shows the output format against the bundled [`test-fixtures/messy-jaffle-shop`](../test-fixtures/messy-jaffle-shop) project. Use it to see what an audit report looks like before installing.
 
 ## Readiness verdict
 
@@ -11,7 +11,7 @@
 **Distance to ready:** Afternoon of doc fixes + a sprint for grain declarations and tests.
 **Confidence:** High.
 
-**In plain terms:** The project is small and cleanly laid out, but an agent pointed at it today will make three concrete mistakes: it will join customers incorrectly because the same entity is named `customer_id`, `cust_id`, and `user_id` across models; it will produce different revenue numbers depending on whether it picks `fct_revenue` or `rpt_daily_revenue` (two models with ambiguous grain built from the same source); and it will SELECT a column that doesn't exist (`customers.loyalty_tier` is documented in YAML but the SQL uses `SELECT *` from a staging model that doesn't emit it — a macro-resolution ambiguity). Description coverage is 46.5% raw, but only 25.6% of columns carry trustworthy descriptions — more than half of the "documented" columns are placeholder restatements ("Customer ID", "The amount", "Primary key").
+**In plain terms:** The project is small and cleanly laid out, but an agent pointed at it today can make four concrete mistakes: join customers incorrectly because the same entity is named `customer_id`, `cust_id`, and `user_id`; produce different revenue numbers depending on whether it picks `fct_revenue` or `rpt_daily_revenue`; SELECT `customers.loyalty_tier`, which is documented in YAML but absent from the SQL output; and misinterpret columns whose descriptions are placeholders such as "Customer ID", "The amount", and "Primary key". Description coverage is 46.5% raw, but only 25.6% of columns carry trustworthy descriptions.
 
 ## Blockers (agent will hit these today)
 
@@ -45,9 +45,18 @@
 **Fix type:** doc_only.
 **Effort:** afternoon.
 
+### 4. YAML documents a column the model does not emit
+
+**What the agent gets wrong:** Uses `customers.loyalty_tier` for a segmentation question and produces a query that fails because the column does not exist.
+**Evidence:** [models/marts/_marts_schema.yml:22](../test-fixtures/messy-jaffle-shop/models/marts/_marts_schema.yml#L22) declares `loyalty_tier`. The static analyzer resolves the `final` CTE through [models/marts/customers.sql:18](../test-fixtures/messy-jaffle-shop/models/marts/customers.sql#L18) and confirms that its output does not include the column. `catalogs.phantom_columns_by_model` reports the finding with `confidence: high` and no unresolved macro signals.
+**Affected models:** `customers`.
+**Blast radius:** Any customer segmentation or loyalty-tier question.
+**Fix:** Either add the intended `loyalty_tier` expression to `customers.sql` or remove the stale YAML declaration.
+**Fix type:** code_or_doc.
+**Effort:** hour.
+
 ### Notes on what did NOT become a Blocker
 
-- **`customers.loyalty_tier` phantom column** — flagged `confidence: provisional` because [models/marts/customers.sql:31](../test-fixtures/messy-jaffle-shop/models/marts/customers.sql#L31) uses `SELECT * from final` and the static analyzer can't resolve whether `loyalty_tier` is in the final CTE's columns. Goes to Hygiene with "re-run with `dbt compile`" as the verification step. If `dbt compile` confirms it's truly missing, promote to Blocker #4.
 - **0 relationship tests, 3 models with zero tests** — forecasts, not evidence. Moved to Hygiene with verification queries.
 
 ## Hygiene (risk factors — verify before trusting the pilot)
@@ -56,7 +65,6 @@
 
 | Risk | Model / column | Verification query | If non-zero |
 |---|---|---|---|
-| Phantom column (provisional) | `customers.loyalty_tier` | `cd test-fixtures/messy-jaffle-shop && dbt compile && grep loyalty_tier target/compiled/...` | promote to Blocker: agent SELECTs a column that doesn't exist |
 | Missing PK test | `int_customer_orders.customer_id` (1 inbound ref) | `SELECT customer_id, COUNT(*) FROM int_customer_orders GROUP BY 1 HAVING COUNT(*) > 1` | promote: fan-out on join to `customers` |
 | Missing PK test | `fct_revenue` (composite grain) | `SELECT order_date, cust_id, has_refund, COUNT(*) FROM fct_revenue GROUP BY 1,2,3 HAVING COUNT(*) > 1` | promote: revenue double-counted |
 | Missing relationships | `orders.customer_id` → `customers.customer_id` | `SELECT COUNT(*) FROM orders a LEFT JOIN customers b ON a.customer_id=b.customer_id WHERE b.customer_id IS NULL AND a.customer_id IS NOT NULL` | promote: orphan orders, LEFT JOIN returns nulls agent won't expect |
@@ -86,7 +94,7 @@ No models currently meet all safety criteria. The closest candidate is `stg_cust
 
 - Any cross-model customer question (Blocker #1).
 - Any revenue question routed through `fct_revenue` vs `rpt_daily_revenue` (Blocker #2).
-- Any question selecting `customers.loyalty_tier` until the phantom is confirmed.
+- Any question selecting `customers.loyalty_tier` until Blocker #4 is resolved.
 
 ## Remediation backlog
 
@@ -94,10 +102,10 @@ No models currently meet all safety criteria. The closest candidate is `stg_cust
 - Rename `cust_id` / `user_id` → `customer_id` project-wide (find-replace).
 - Add `Scope:` + `Grain:` paragraphs to `fct_revenue` and `rpt_daily_revenue`.
 - Replace the 8 weak descriptions listed in Appendix.
+- Either implement `customers.loyalty_tier` or remove it from the YAML schema.
 - Add an `accepted_values` test on `orders.status` and `stg_orders.status` (listing the canonical set).
 
 ### This sprint (model + test changes)
-- Compile `dbt compile` and re-audit to confirm or dismiss the `customers.loyalty_tier` phantom.
 - Add `unique` + `not_null` tests to all FKs.
 - Add relationship test on `orders.customer_id` → `customers.customer_id`.
 
@@ -175,7 +183,7 @@ No models currently meet all safety criteria. The closest candidate is `stg_cust
 
 | Confidence | Model | Count | Phantom columns | Macro signals | YAML path |
 |---|---|---|---|---|---|
-| provisional | customers | 1 | `loyalty_tier` | select_star | models/marts/_marts_schema.yml |
+| high | customers | 1 | `loyalty_tier` | none | models/marts/_marts_schema.yml |
 
 **Categorical columns with values only in SQL** (via `test_summary.categorical_columns_without_accepted_values`)
 
@@ -191,7 +199,6 @@ No models currently meet all safety criteria. The closest candidate is `stg_cust
 ## What this audit cannot detect
 
 - Runtime data quality (null rates, freshness, row counts) — requires executing queries; verification queries in Hygiene cover this.
-- Whether `customers.loyalty_tier` is actually emitted by the compiled SQL — requires `dbt compile`.
 - Whether a join makes business sense.
 
 ## Audit metadata
@@ -202,8 +209,8 @@ No models currently meet all safety criteria. The closest candidate is `stg_cust
 | Models reviewed by LLM | 10 (inline — subagent threshold is >30 models) |
 | Review packets generated | 2 |
 | Concept index size | 6 concepts across 10 models |
-| Blockers | 3 |
-| Hygiene items | 5 |
+| Blockers | 4 |
+| Hygiene items | 4 |
 | Inventory method | script |
 
 ---

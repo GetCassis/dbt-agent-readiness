@@ -1,161 +1,186 @@
 # dbt-agent-readiness
 
-A Claude Code skill that audits a dbt project for what an AI agent will get wrong if you point it at the data today: wrong metric, wrong table, missed rows, broken joins.
+Find the places your AI analyst will return a plausible — but wrong — answer.
 
-Built for dbt teams piloting AI analysts, copilots, or internal data agents.
+`dbt-agent-readiness` is a Claude Code skill that audits a dbt project for
+ambiguous metrics, unsafe joins, misleading documentation, invalid columns,
+and unclear model grain. It is built for dbt teams piloting AI analysts,
+copilots, or internal data agents.
 
-## What it catches
+The audit produces one evidence-backed Markdown report containing:
 
-**Blockers** (code evidence, agent will hit today):
-- Two models claim to represent revenue but calculate it differently
-- The same entity is named `customer_id`, `cust_id`, and `user_id` across models
-- A YAML-declared column the SQL doesn't actually emit (agent SELECTs a column that doesn't exist)
-- A model description promises totality but the SQL filters rows
-- One `entity_id` column refers to different entities across models
-- Description says COUNT, SQL does SUM
-- `ref()` to a model that doesn't exist (queries fail at compile)
-- Unit drift (EUR / EUR cents, Wh / kWh)
-- Within-model concept collision (`deployment_start_date` + `zone_deployment_start_date`)
+- what an agent will get wrong today
+- what still needs runtime verification
+- which models are safe to query
+- what to fix first
 
-**Hygiene** (risk factors, each shipped with a SQL query you can run to verify):
-- Missing PK / not-null / relationship / accepted_values tests
-- Grain undeclared when the description is also silent on cardinality
-- Macro-using models flagged for `dbt compile` when the manifest is missing
+It does not query your warehouse, require warehouse credentials, or modify your
+dbt models and configuration.
 
-**Optional docs mode** (context outside the dbt layer):
-- A doc defines a term one way and another doc defines it differently, with no authoritative dbt definition to settle it (Blocker)
-- A doc claims a model has a column it does not emit (Blocker when the model's YAML mirrors its SQL)
-- Models documented in prose vs models documented nowhere (coverage gap)
-- Docs pointing off-repo at Google Docs / Confluence / Notion / Slack an agent cannot read
-- Stale docs (deprecated markers, years-old dates)
+## Quick start
 
-## Sample output
-
-A Blocker from the bundled sample report:
-
-```
-### 1. The same entity is named three different ways across models
-
-What the agent gets wrong: Asked "how many orders did customer X place?",
-the agent joins orders.customer_id to customers.customer_id and misses
-the rows in fct_revenue where the column is cust_id.
-
-Evidence: catalogs.concept_variants cluster customer_id has distinct
-names ['cust_id', 'customer_id', 'user_id'].
-models/marts/fct_revenue.sql:13 emits o.cust_id.
-models/marts/customers.sql:11 aliases o.cust_id as customer_id.
-
-Fix: Rename to one canonical form (customer_id).
-Effort: afternoon.
-```
-
-See the [full sample report](examples/messy-jaffle-shop-audit.md) generated against the bundled test fixture.
-
-## Setup
-
-Clone into your Claude Code skills directory:
+Clone the skill into your personal Claude Code skills directory:
 
 ```bash
 git clone https://github.com/GetCassis/dbt-agent-readiness ~/.claude/skills/dbt-agent-readiness
+python3 -m pip install -r ~/.claude/skills/dbt-agent-readiness/requirements.txt
 ```
 
-Install Python dependencies:
+Then ask Claude Code:
 
-```bash
-pip install -r ~/.claude/skills/dbt-agent-readiness/requirements.txt
-```
-
-**Requirements:**
-- Claude Code (any recent version with Skills support)
-- Python 3.8+
-- `pyyaml` and [`sqlglot`](https://github.com/tobymao/sqlglot) (installed via `requirements.txt`)
-
-**Recommended:** run `dbt compile` in the target project before auditing so the skill can resolve macros (`dbt_utils.star`, `SELECT *`). Without it, phantom-column findings on macro-using models are suppressed rather than emitted.
-
-## Run the audit
-
-In Claude Code:
-
-```
+```text
 Run the dbt-agent-readiness skill on /path/to/dbt/project
 ```
 
 The report is written to `{project_path}/dbt-agent-readiness.md`.
 
-### Optional: scan docs outside the dbt layer
+### Requirements
 
-The audit is dbt-only by default. To also map the documentation that lives
-outside the dbt layer (repo `docs/`, runbooks, READMEs, a dropped `.md`), opt in:
+- [Claude Code with Skills support](https://code.claude.com/docs/en/skills)
+- Python 3.9+
+- `pyyaml` and [`sqlglot`](https://github.com/tobymao/sqlglot), installed by
+  the command above
 
-```
-Run dbt-agent-readiness on /path/to/dbt/project and include the docs
-```
+Running `dbt compile` in the target project before the audit is recommended.
+It lets the skill resolve generated columns from macros such as
+`dbt_utils.star`, `SELECT *`, and Jinja loops. When compiled SQL is unavailable,
+checks that cannot be supported confidently are suppressed instead of reported
+as findings.
 
-If your dbt project sits in a subdirectory of a larger repo, point it at the
-repo's documentation explicitly so docs above the project are included:
+## See what it finds
 
-```
-Run dbt-agent-readiness on ./transform/analytics and scan the docs in ./docs
-```
+On the bundled 10-model test project, the audit finds four concrete ways an
+agent can fail:
 
-Docs mode reports where context lives, where it duplicates the dbt layer, where
-a doc claims columns a model does not emit, where definitions disagree with no
-authoritative dbt fallback (those become Blockers), where docs go stale, and
-where they point off-repo at sources an agent cannot read (Google Docs,
-Confluence, Notion, Slack). It is deterministic-first: no documentation prose is
-sent to the model except short flagged snippets, so cost scales with findings,
-not doc volume.
+| Failure | What the agent gets wrong |
+|---|---|
+| Inconsistent entity names | Misses rows when joining `customer_id`, `cust_id`, and `user_id` |
+| Competing revenue marts | Picks between two plausible models with different grains |
+| Misleading descriptions | Treats labels such as “The amount” as sufficient metric semantics |
+| Phantom documentation | Selects `customers.loyalty_tier`, which is declared in YAML but not emitted by SQL |
+
+Each finding includes code evidence, affected models, blast radius, a proposed
+fix, and an effort estimate. See the
+[full sample report](examples/messy-jaffle-shop-audit.md).
+
+## What it checks
+
+| Failure mode | Examples |
+|---|---|
+| Wrong metric or table | Competing revenue definitions, COUNT/SUM disagreement, undeclared grain |
+| Missed or duplicated rows | Inconsistent entity names, unsafe joins, missing uniqueness guarantees |
+| Query failure | Broken `ref()`, YAML columns absent from SQL, undefined SQL references |
+| Hidden semantics | Undisclosed filters, unit drift, one column name used for different entities |
+| Unreliable context | Weak descriptions, stale docs, conflicting definitions, off-repo sources |
+
+The report separates these into two evidence levels:
+
+- **Blockers** are code-evidenced failures an agent can hit today.
+- **Hygiene** items are risk factors. Each comes with a query or concrete step
+  to verify, promote, or dismiss it.
+
+## How it works
+
+1. **Deterministic inventory.** Python scans dbt SQL, YAML, tests, lineage,
+   semantic-layer metadata, and `target/manifest.json` when available.
+2. **Targeted review.** Claude reviews flagged concepts and important models,
+   rather than rereading every file indiscriminately.
+3. **Root-cause report.** Related symptoms are collapsed into a short list of
+   blockers, verification work, safe starting models, and prioritized fixes.
+
+Small projects are analyzed inline. Larger projects use the same full-project
+inventory plus focused parallel reviews, with checkpoints before expensive
+deep-pass work. See [`SKILL.md`](SKILL.md) for the current dispatch behavior.
 
 ## What the report contains
 
-1. **Readiness verdict**: ready / not ready / unsafe, with distance to ready.
-2. **Blockers**: evidence-backed failures an agent will hit today, each with affected models, blast radius, fix, and effort estimate.
-3. **Hygiene**: risk factors, each with a verification query you can run to promote or dismiss.
-4. **Safe starting perimeter**: which models an agent can query safely today.
-5. **Remediation backlog**: prioritized list of fixes.
+1. **Readiness verdict:** ready, not ready, or unsafe, with distance to ready.
+2. **Blockers:** failures backed by code evidence, with affected models, blast
+   radius, fix, and effort.
+3. **Hygiene:** risks paired with runnable verification queries or checks.
+4. **Safe starting perimeter:** models an agent can query safely today or after
+   one small fix.
+5. **Remediation backlog:** fixes prioritized into this week, this sprint, and
+   later.
 
-## Scales to project size
+## Optional: include documentation outside dbt
 
-- ≤30 models: inline analysis
-- 31 to 200 models: 3 to 4 parallel subagents (flag-driven review + per-model deep pass)
-- \>200 models: checkpoint before spawning subagents
+The audit is dbt-only by default. To map context in repository docs, runbooks,
+READMEs, or other Markdown files, opt in explicitly:
+
+```text
+Run dbt-agent-readiness on /path/to/dbt/project and include the docs
+```
+
+If the dbt project sits inside a larger repository, you can name the external
+documentation location:
+
+```text
+Run dbt-agent-readiness on ./transform/analytics and scan the docs in ./docs
+```
+
+Docs mode reports coverage gaps, definitions that disagree, docs that claim
+columns a model does not emit, stale material, and links to context an agent
+cannot read in Google Docs, Confluence, Notion, or Slack. The deterministic scan
+reads the corpus; Claude sees only short snippets associated with flagged
+findings, so model usage scales with findings rather than document volume.
+
+## Accuracy and validation
+
+The deterministic layer has 126 regression checks covering SQL column
+extraction, multi-hop CTEs, macros, broken column references, fan-out joins,
+documentation drift, and false-positive suppression. Test fixtures include
+ground-truth files that distinguish planted failures from valid dbt patterns.
+
+The audit is conservative when evidence is incomplete:
+
+- macro-dependent column checks are suppressed when compiled SQL is required
+- missing tests remain Hygiene until a verification query shows a real failure
+- related findings are clustered into root causes rather than counted as
+  independent blockers
+
+See [`CHANGELOG.md`](CHANGELOG.md) for validation notes and precision changes by
+release.
 
 ## Data handling
 
-The skill reads your dbt project files locally (SQL, YAML, descriptions, optionally `target/manifest.json`). Claude Code, running in your session, sends that content to Anthropic as part of its normal operation. The skill itself does not open network connections, does not query your warehouse, and does not require warehouse credentials. It writes a single report file to `{project_path}/dbt-agent-readiness.md` and modifies nothing else in your project.
+The skill reads SQL, YAML, descriptions, and optionally
+`target/manifest.json` from your local dbt project. Claude Code sends relevant
+content to Anthropic as part of its normal operation. The skill itself opens no
+network connections at runtime, executes no warehouse queries, and needs no
+warehouse credentials. It writes only `{project_path}/dbt-agent-readiness.md`.
 
 ## What this audit cannot detect
 
-- Runtime data quality (null rates, freshness, row counts). Hygiene items carry verification queries you can run against the warehouse.
-- Source system changes. Only runtime monitoring catches upstream format drift.
-- Whether a join makes business sense. The audit sees structure, not domain validity.
-- Query patterns and usage frequency. Would require query logs.
-- BI tool metric conflicts. Would require Looker / Tableau export access.
+- Runtime data quality such as null rates, freshness, and row counts. Hygiene
+  findings include queries you can run against the warehouse.
+- Source-system changes or upstream format drift.
+- Whether a join is conceptually correct for your business domain.
+- Query frequency or real usage patterns without query logs.
+- Metric conflicts that exist only in BI tools such as Looker or Tableau.
 
-## Versions
+## Repository map
 
-Tagged per release. See [`CHANGELOG.md`](CHANGELOG.md). The inventory JSON schema may change between major versions; don't pin against it.
-
-## Structure
-
-```
-SKILL.md                 Orchestrator that routes all steps and spawns subagents
+```text
+SKILL.md                 Audit workflow and dispatch rules
 report-template.md       Output report template
-phases/                  Phase subagent prompts
-scripts/inventory.py     Deterministic inventory (SQL, concepts, catalogs)
-scripts/dispatch_prep.py Review-packet generation, importance scoring
-scripts/docs_scan.py     Deterministic docs scan (optional docs mode)
-scripts/tests/           Regression gates for the deterministic checks
+phases/                  Focused review instructions
+scripts/inventory.py     Deterministic dbt inventory and checks
+scripts/dispatch_prep.py Review packets and importance scoring
+scripts/docs_scan.py     Optional deterministic docs scan
+scripts/tests/           Regression checks
 examples/                Example audit reports
-test-fixtures/           Test projects for manual smoke testing
-CHANGELOG.md             Version history
-TROUBLESHOOTING.md       Common issues and fixes
-LICENSE                  MIT
+test-fixtures/           dbt projects with planted ground truth
+CHANGELOG.md             Release history and validation notes
+TROUBLESHOOTING.md       Common failures and fixes
 ```
 
-## Troubleshooting
+## Versions and troubleshooting
 
-See [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) for common failure modes.
+Releases are tagged. See [`CHANGELOG.md`](CHANGELOG.md) before depending on the
+inventory JSON schema, which may change between major versions.
+
+For setup and audit failures, see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ## License
 
