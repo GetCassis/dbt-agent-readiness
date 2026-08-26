@@ -159,6 +159,14 @@ warehouse credentials. It writes only `{project_path}/dbt-agent-readiness.md`.
 - Query frequency or real usage patterns without query logs.
 - Metric conflicts that exist only in BI tools such as Looker or Tableau.
 
+## After the audit
+
+The report says what an agent will get wrong today. Fixing the dbt project closes part of it. The
+rest is context that does not live in dbt at all: what a row means, which metric is the defined
+one, how two tables join. The [context bootstrap kit](https://github.com/GetCassis/ontology-bootstrap)
+assembles that from the sources your stack already has — the dbt project, the warehouse schema,
+dashboards, query history and docs — and drafts a reviewable ontology with the evidence attached.
+
 ## Repository map
 
 ```text
