@@ -2,6 +2,38 @@
 
 All notable changes to the dbt-agent-readiness skill.
 
+## 1.6.2 (2026-06-22)
+
+Phantom-column false-positive fix in `inventory.py`. A projection that mixes a
+star with explicit columns (`select a.*, x`, `select x, a.*`) or uses a partial
+star (`a.* EXCLUDE(...)` on Snowflake, `* EXCEPT(...)` on BigQuery) resolves only
+the *explicit* columns statically; the star injects an unknowable set on top. The
+old detector caught only a *leading* `SELECT *` (`_SELECT_STAR_RE`) and gated even
+that behind `columns_resolved`, so a mixed/partial star left the extracted list
+silently incomplete. Every YAML column absent from that partial list was then
+flagged phantom and subtracted from effective coverage, deflating the headline
+number with false positives on star-heavy projects.
+
+- **`_PARTIAL_STAR_RE` forces suppression for mixed/partial stars (inventory.py).**
+  A star adjacent to a comma (either side) or followed by `EXCLUDE`/`EXCEPT` emits
+  a `partial_star` macro signal that is NOT gated by `columns_resolved`, because
+  the resolved column list provably misses the star's contribution. A sole
+  `SELECT * FROM <cte>` that genuinely expands through the CTE chain is unchanged:
+  it still goes through `_SELECT_STAR_RE` + the `columns_resolved` gate, and the
+  lineage path still resolves traceable stars. The change is monotonic: it only
+  moves phantom findings into `phantom_columns_suppressed_no_manifest`, never adds
+  a finding, so effective coverage can only rise.
+- **Impact (no compiled manifest).** snowplow effective coverage 77.7% → 92.3%
+  (`phantom_documented` 127 → 0; `base_events_this_run`'s `a.* EXCLUDE(...)` and
+  `users_sessions_this_run`'s `select a.*, …` were the false sources); tuva 81.4%
+  → 90.8% (27 `select model.*, extra_cols` models). stripe, salesforce, cagov,
+  mattermost, and ga4 are unchanged by this regex (A/B isolated). Caught on the
+  v1.6.1 publish-set validation run against snowplow_web.
+- **Distribution packaging.** `.claude-plugin/plugin.json` makes the repo an
+  installable Claude Code plugin (the root `SKILL.md` auto-loads as the skill),
+  and the README now leads with the cross-tool `npx skills add` install
+  alongside the git-clone path.
+
 ## 1.6.1 (2026-06-22)
 
 Precision follow-up to the 1.6.0 conditional-severity rework. 1.6.0 routes

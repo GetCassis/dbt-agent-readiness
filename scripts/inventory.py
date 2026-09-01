@@ -2747,6 +2747,19 @@ _MACRO_PATTERNS = [
 _SELECT_STAR_RE = re.compile(
     r'\bSELECT\b\s+(?:/\*.*?\*/\s+)?(?:\w+\.)?\*(?:\s*,|\s+FROM)',
     re.IGNORECASE | re.DOTALL)
+# A star mixed with explicit columns (`select a.*, x`, `select x, a.*`) or a
+# partial star (`a.* EXCLUDE(...)` on Snowflake, `* EXCEPT(...)` on BigQuery).
+# In all of these the static extractor resolves only the *explicit* columns;
+# the star injects an unknowable set on top, so the extracted list is provably
+# incomplete and a YAML column absent from it is NOT reliably phantom. Unlike a
+# sole `SELECT * FROM <cte>` (handled by _SELECT_STAR_RE + the columns_resolved
+# gate, where the star expansion IS the whole output), this is never safe to
+# trust without a compiled manifest, regardless of columns_resolved.
+_PARTIAL_STAR_RE = re.compile(
+    r',\s*(?:\w+\.)?\*'                       # star after a comma: ", a.*"
+    r'|(?:\w+\.)?\*\s*,'                      # star before a comma: "a.*,"
+    r'|(?:\w+\.)?\*\s+(?:exclude|except)\b',  # partial star: "a.* exclude(...)"
+    re.IGNORECASE | re.DOTALL)
 _JINJA_FOR_SELECT_RE = re.compile(
     r"{%\s*for\b.*?%}.*?(?:select|,\s*\w+|as\s+\w+).*?{%\s*endfor\s*%}",
     re.IGNORECASE | re.DOTALL)
@@ -2845,6 +2858,10 @@ def _detect_macro_column_generation(sql, columns_resolved=False):
             signals.append(m.group(0))
     if _SELECT_STAR_RE.search(sql) and not columns_resolved:
         signals.append('select_star')
+    # A mixed/partial star makes the extracted column list incomplete even when
+    # the explicit columns parsed (columns_resolved=True), so it is NOT gated.
+    if _PARTIAL_STAR_RE.search(sql):
+        signals.append('partial_star')
     if _JINJA_FOR_SELECT_RE.search(sql):
         signals.append('jinja_for_loop')
     if _JINJA_SET_BLOCK_RE.search(sql):

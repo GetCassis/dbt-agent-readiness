@@ -1,0 +1,15 @@
+{
+  "name": "dbt-agent-readiness",
+  "displayName": "dbt agent readiness",
+  "version": "1.6.2",
+  "description": "Audit a dbt project for what an AI agent will get wrong if you point it at the data today: wrong metric, wrong table, missed rows, broken joins. Produces one evidence-backed report with blockers, verification queries, and a safe starting perimeter.",
+  "author": {
+    "name": "Cassis",
+    "email": "hello@getcassis.com",
+    "url": "https://getcassis.com"
+  },
+  "homepage": "https://github.com/GetCassis/dbt-agent-readiness",
+  "repository": "https://github.com/GetCassis/dbt-agent-readiness",
+  "license": "MIT",
+  "keywords": ["dbt", "analytics", "data-quality", "ai-agents", "audit", "text-to-sql"]
+}

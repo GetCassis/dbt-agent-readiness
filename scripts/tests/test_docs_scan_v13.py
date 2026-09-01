@@ -17,7 +17,6 @@ Covers:
      bare `README.md`; and byte-identical docs are deduped so their identifiers,
      claims, and pointers are not double counted.
 """
-import shutil
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -116,7 +115,8 @@ case("doc claims = real columns only, no 'property'",
      cols == ['customer_id', 'email'], f"got={cols}")
 
 # ── B: consistent path base + byte-identical dedup ──────────────────────────
-tmp = Path(tempfile.mkdtemp())
+_tmpdir = tempfile.TemporaryDirectory()
+tmp = Path(_tmpdir.name)
 try:
     (tmp / 'dbt_project.yml').write_text(
         'name: tmptest\nprofile: tmptest\nmodel-paths: ["models"]\n')
@@ -150,7 +150,7 @@ try:
          Path(dc['path_base']).resolve() == tmp.resolve(),
          f"path_base={dc['path_base']}")
 finally:
-    shutil.rmtree(tmp, ignore_errors=True)
+    _tmpdir.cleanup()
 
 # ── C: semantic-layer metric/measure descriptions are authoritative ─────────
 # inventory carries the boolean under `has_description`; docs_scan must read that

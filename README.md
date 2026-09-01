@@ -19,11 +19,22 @@ dbt models and configuration.
 
 ## Quick start
 
-Clone the skill into your personal Claude Code skills directory:
+Install with the [`skills` CLI](https://github.com/vercel-labs/skills), which works for Claude Code, Cursor, Codex, and most other coding agents:
+
+```bash
+npx skills add GetCassis/dbt-agent-readiness
+```
+
+Or clone the skill into your personal Claude Code skills directory:
 
 ```bash
 git clone https://github.com/GetCassis/dbt-agent-readiness ~/.claude/skills/dbt-agent-readiness
-python3 -m pip install -r ~/.claude/skills/dbt-agent-readiness/requirements.txt
+```
+
+Whichever route you pick, install the two Python dependencies:
+
+```bash
+python3 -m pip install "pyyaml>=6.0" "sqlglot>=30.0,<31.0"
 ```
 
 Then ask Claude Code:
