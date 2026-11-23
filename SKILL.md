@@ -8,14 +8,7 @@ description: |
   Use when asked to "audit", "agent-readiness", "scan dbt project", "check data quality",
   "how ready is my data for AI agents", or "run dbt-agent-readiness."
 argument-hint: "[path/to/dbt/project]"
-allowed-tools:
-  - Bash
-  - Glob
-  - Read
-  - Grep
-  - Write
-  - AskUserQuestion
-  - Agent
+allowed-tools: Bash Glob Read Grep Write AskUserQuestion Agent
 ---
 
 # dbt-agent-readiness (orchestrator)
