@@ -2,6 +2,17 @@
 
 All notable changes to the dbt-agent-readiness skill.
 
+## 1.6.5 (2026-11-23)
+
+Packaging and structure. No change to what the audit checks or how it classifies findings.
+
+- Synthesis rules (Blocker/Hygiene classification, verdict, safe perimeter, backlog) and the list of catalogs the report emits move from `SKILL.md` to `phases/synthesis.md`, which the orchestrator reads inline at Step 5b. Two duplicated rules were merged: the `phantom_columns_by_model` entry and the docs-mode agent grounding model rule.
+- `SKILL.md` drops the design-principle bullets that described `inventory.py` internals and links every phase file from a file table. `phases/descriptions.md` and `phases/doc-vs-sql.md` are marked as not dispatched.
+- The description names the failure modes and the questions people ask ("is our data AI-ready", "why does the agent pick the wrong table") instead of the subagent architecture.
+- `allowed-tools` is a space-delimited string, as the Agent Skills spec expects.
+- The report footer keeps the credit line only.
+- Cursor plugin manifest (`.cursor-plugin/plugin.json`) and a square logo for the Cursor Marketplace.
+
 ## 1.6.2 (2026-06-22)
 
 Phantom-column false-positive fix in `inventory.py`. A projection that mixes a
